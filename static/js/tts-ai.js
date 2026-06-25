@@ -233,6 +233,7 @@ class AITTSManager {
         }
         this._queue = [];
         this._processing = false;
+        window.dispatchEvent(new CustomEvent('odysseus:tts-idle'));
 
         if (this.useBrowserTTS) {
             window.speechSynthesis.cancel();
@@ -260,6 +261,7 @@ class AITTSManager {
     async _processQueue() {
         if (this._processing) return;
         this._processing = true;
+        window.dispatchEvent(new CustomEvent('odysseus:tts-start'));
 
         while (this._queue.length > 0) {
             const item = this._queue[0];
@@ -275,6 +277,7 @@ class AITTSManager {
         }
 
         this._processing = false;
+        window.dispatchEvent(new CustomEvent('odysseus:tts-idle'));
     }
 
     async _playQueueItem(item) {

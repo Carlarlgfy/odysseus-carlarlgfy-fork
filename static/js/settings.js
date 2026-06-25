@@ -838,6 +838,13 @@ async function initTtsSettings() {
     } else {
       modelSelect.style.display = 'none'; modelInput.style.display = '';
       voiceSelect.style.display = 'none'; voiceInput.style.display = prov === 'disabled' ? 'none' : '';
+      if (prov === 'piper') {
+        modelInput.placeholder = '/path/to/piper-voice.onnx';
+        voiceInput.placeholder = 'speaker id (optional)';
+      } else {
+        modelInput.placeholder = 'model name';
+        voiceInput.placeholder = 'af_heart';
+      }
     }
   }
 
@@ -875,7 +882,13 @@ async function initTtsSettings() {
   async function saveTTS() {
     try {
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tts_enabled: ttsEnabledToggle ? ttsEnabledToggle.checked : true, tts_provider: provSel.value, tts_model: getModel() || 'tts-1', tts_voice: getVoice() || 'alloy', tts_speed: speedSelect.value || '1' }) });
+        body: JSON.stringify({
+          tts_enabled: ttsEnabledToggle ? ttsEnabledToggle.checked : true,
+          tts_provider: provSel.value,
+          tts_model: getModel() || (provSel.value === 'piper' ? '' : 'tts-1'),
+          tts_voice: getVoice() || (provSel.value === 'piper' ? '' : 'alloy'),
+          tts_speed: speedSelect.value || '1'
+        }) });
       ttsMsg.textContent = 'Saved'; ttsMsg.style.color = 'var(--fg)'; setTimeout(() => { ttsMsg.textContent = ''; }, 2000);
       if (window.aiTTSManager) window.aiTTSManager.checkAvailability();
     } catch (e) { ttsMsg.textContent = 'Failed to save'; ttsMsg.style.color = 'var(--red)'; }
@@ -888,7 +901,8 @@ async function initTtsSettings() {
 
   provSel.addEventListener('change', function() {
     var prov = provSel.value;
-    if (prov === 'local') voiceInput.value = 'af_heart';
+    if (prov === 'piper') { modelInput.value = ''; voiceInput.value = ''; }
+    else if (prov === 'local') voiceInput.value = 'af_heart';
     else if (isEndpoint()) { voiceSelect.value = 'alloy'; modelSelect.value = 'tts-1'; }
     else if (prov === 'browser') { voiceInput.value = ''; voiceInput.placeholder = 'OS default voice'; }
     updateVisibility();
@@ -1051,6 +1065,170 @@ async function initSttSettings() {
   modelInput.addEventListener('change', saveSTT);
   langInput.addEventListener('change', saveSTT);
   if (sttEnabledToggle) sttEnabledToggle.addEventListener('change', function() { syncSttDisabled(); saveSTT(); });
+}
+
+let piperVoiceModal = null;
+let piperPreviewAudio = null;
+
+function _voiceLanguageName(code) {
+  const names = {
+    en: 'English', fr: 'French', es: 'Spanish', de: 'German',
+    it: 'Italian', pt: 'Portuguese', nl: 'Dutch', pl: 'Polish',
+    ru: 'Russian', zh: 'Chinese'
+  };
+  return names[code] || code;
+}
+
+function _ensurePiperVoiceModal() {
+  if (piperVoiceModal) return piperVoiceModal;
+  piperVoiceModal = document.createElement('div');
+  piperVoiceModal.id = 'piper-voice-modal';
+  piperVoiceModal.className = 'modal hidden';
+  piperVoiceModal.innerHTML = `
+    <div class="modal-content piper-voice-modal-content" role="dialog" aria-label="Voice library">
+      <div class="modal-header">
+        <h2>Voice Library</h2>
+        <button class="close-btn" id="close-piper-voice-modal" aria-label="Close voice library">✖</button>
+      </div>
+      <div class="modal-body piper-voice-modal-body">
+        <div class="admin-toggle-sub" style="margin-bottom:10px">
+          Download free Piper voices, preview installed voices, and assign a voice per language.
+        </div>
+        <div id="piper-voice-status" class="admin-toggle-sub"></div>
+        <div id="piper-voice-grid" class="piper-voice-grid"></div>
+      </div>
+    </div>`;
+  document.body.appendChild(piperVoiceModal);
+  piperVoiceModal.querySelector('#close-piper-voice-modal').addEventListener('click', closeVoiceLibrary);
+  piperVoiceModal.addEventListener('click', (e) => {
+    if (e.target === piperVoiceModal) closeVoiceLibrary();
+  });
+  return piperVoiceModal;
+}
+
+function closeVoiceLibrary() {
+  if (piperPreviewAudio) {
+    piperPreviewAudio.pause();
+    piperPreviewAudio = null;
+  }
+  if (piperVoiceModal) piperVoiceModal.classList.add('hidden');
+}
+
+async function _loadPiperVoiceState() {
+  const res = await fetch('/api/tts/piper/voices', { credentials: 'same-origin' });
+  if (!res.ok) throw new Error('Failed to load Piper voices');
+  return res.json();
+}
+
+function _setPiperVoiceStatus(text, isError) {
+  const status = el('piper-voice-status');
+  if (!status) return;
+  status.textContent = text || '';
+  status.style.color = isError ? 'var(--red, #e55)' : '';
+}
+
+async function _renderPiperVoiceLibrary() {
+  const modal = _ensurePiperVoiceModal();
+  const grid = modal.querySelector('#piper-voice-grid');
+  grid.innerHTML = '<div class="admin-toggle-sub">Loading voices...</div>';
+  try {
+    const state = await _loadPiperVoiceState();
+    const assigned = state.assigned || {};
+    grid.innerHTML = (state.catalog || []).map((voice) => {
+      const assignedPath = assigned[voice.language] || '';
+      const isAssigned = assignedPath === voice.model_path;
+      const installed = !!voice.installed;
+      return `
+        <div class="piper-voice-card" data-voice-id="${esc(voice.id)}">
+          <div class="piper-voice-card-head">
+            <div>
+              <div class="piper-voice-name">${esc(_voiceLanguageName(voice.language))} · ${esc(voice.name)}</div>
+              <div class="piper-voice-meta">${esc(voice.locale)} · ${esc(voice.quality)} · ${esc(voice.gender || '')}</div>
+            </div>
+            <span class="piper-voice-badge ${installed ? 'installed' : ''}">${installed ? 'Installed' : 'Available'}</span>
+          </div>
+          <div class="piper-voice-sample">${esc(voice.sample || '')}</div>
+          <div class="piper-voice-actions">
+            <button type="button" class="admin-btn-sm piper-preview-btn" ${installed ? '' : 'disabled'}>Preview</button>
+            <button type="button" class="admin-btn-sm piper-download-btn" ${installed ? 'disabled' : ''}>${installed ? 'Downloaded' : 'Download'}</button>
+            <button type="button" class="admin-btn-sm piper-assign-btn" ${installed ? '' : 'disabled'}>${isAssigned ? 'Assigned' : 'Assign'}</button>
+          </div>
+        </div>`;
+    }).join('');
+
+    grid.querySelectorAll('.piper-voice-card').forEach((card) => {
+      const voiceId = card.dataset.voiceId;
+      const voice = (state.catalog || []).find(v => v.id === voiceId);
+      card.querySelector('.piper-preview-btn')?.addEventListener('click', async () => {
+        _setPiperVoiceStatus('Loading preview...');
+        try {
+          const res = await fetch('/api/tts/piper/preview', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ voice_id: voiceId })
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail?.message || 'Preview failed');
+          }
+          const blob = await res.blob();
+          if (piperPreviewAudio) piperPreviewAudio.pause();
+          piperPreviewAudio = new Audio(URL.createObjectURL(blob));
+          await piperPreviewAudio.play();
+          _setPiperVoiceStatus('');
+        } catch (e) {
+          _setPiperVoiceStatus(e.message, true);
+        }
+      });
+      card.querySelector('.piper-download-btn')?.addEventListener('click', async (e) => {
+        e.currentTarget.disabled = true;
+        _setPiperVoiceStatus('Downloading voice...');
+        try {
+          const res = await fetch('/api/tts/piper/download', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ voice_id: voiceId })
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail?.message || 'Download failed');
+          }
+          _setPiperVoiceStatus('Downloaded');
+          await _renderPiperVoiceLibrary();
+        } catch (err) {
+          _setPiperVoiceStatus(err.message, true);
+          e.currentTarget.disabled = false;
+        }
+      });
+      card.querySelector('.piper-assign-btn')?.addEventListener('click', async () => {
+        _setPiperVoiceStatus('Assigning voice...');
+        try {
+          const res = await fetch('/api/tts/piper/assign', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ language: voice.language, model_path: voice.model_path })
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail?.message || 'Assign failed');
+          }
+          if (window.aiTTSManager) window.aiTTSManager.checkAvailability();
+          _setPiperVoiceStatus(`Assigned ${_voiceLanguageName(voice.language)} voice`);
+          await _renderPiperVoiceLibrary();
+        } catch (err) {
+          _setPiperVoiceStatus(err.message, true);
+        }
+      });
+    });
+  } catch (e) {
+    grid.innerHTML = '';
+    _setPiperVoiceStatus(e.message, true);
+  }
+}
+
+export function openVoiceLibrary() {
+  _ensurePiperVoiceModal().classList.remove('hidden');
+  _renderPiperVoiceLibrary();
 }
 
 /* ═══════════════════════════════════════════
@@ -5260,7 +5438,7 @@ export function close() {
   }
 }
 
-const settingsModule = { open, close, initIntegrations, initUnifiedIntegrations, syncAdminVisibility, refreshAiModelEndpoints };
+const settingsModule = { open, close, openVoiceLibrary, initIntegrations, initUnifiedIntegrations, syncAdminVisibility, refreshAiModelEndpoints };
 
 
 export default settingsModule;

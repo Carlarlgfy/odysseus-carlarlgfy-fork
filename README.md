@@ -329,9 +329,32 @@ To expose Odysseus on a local network or Tailscale with HTTPS:
 | Package | Feature unlocked |
 |---------|-----------------|
 | `faster-whisper` | Local speech-to-text (microphone -> text) via the "local" STT provider. |
+| `piper-tts` | Local text-to-speech via the "piper" TTS provider. Requires a Piper `.onnx` voice model path. |
 | `duckduckgo-search` | DuckDuckGo as a search provider option. |
 | `PyMuPDF` | PDF page rendering in the side viewer panel and form-filling. (Note: AGPL-3.0) |
 | `markitdown` | Office/EPUB document text extraction (converts .docx/.xlsx/.pptx/.xls/.epub to Markdown). |
+
+### Continuous Voice Loop
+The voice test branch adds a dedicated microphone loop button next to Send. When
+active, Odysseus keeps the microphone stream live, segments utterances when
+volume drops below the silence threshold, transcribes each utterance through the
+configured STT provider, and queues completed transcripts for the normal chat
+submit path. The mic continues listening while transcription or LLM generation
+is in progress, so additional speech is queued instead of dropped. Transcripts
+and assistant replies remain preserved as regular text in the chat.
+
+For fully local voice:
+
+1. Install optional speech dependencies:
+   ```bash
+   ./venv/bin/pip install faster-whisper piper-tts
+   ```
+2. Set STT to `local` with model `base` or another faster-whisper model.
+3. Set TTS to `piper` and set the model field to a Piper voice `.onnx` file.
+   The launcher also honors `ODYSSEUS_PIPER_MODEL`.
+4. Use the Voice Library button to download/preview Piper voices and assign
+   voices by language. Piper TTS will route mixed-language responses through the
+   assigned language voices when possible.
 
 ### Outlook / Office 365 email
 Odysseus email accounts currently use IMAP/SMTP username-password auth. Outlook

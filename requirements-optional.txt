@@ -12,6 +12,10 @@
 # GPU-accelerated transcription — it's auto-detected, CPU is used otherwise.
 faster-whisper
 
+# Local text-to-speech via the Piper CLI. Requires a Piper voice model (.onnx)
+# configured through the TTS model field or ODYSSEUS_PIPER_MODEL.
+piper-tts
+
 # DuckDuckGo as a search provider option.
 # Install if you want DDG in the search-provider dropdown.
 # Alternatives: SearXNG, Brave, Tavily, Serper, Google PSE.

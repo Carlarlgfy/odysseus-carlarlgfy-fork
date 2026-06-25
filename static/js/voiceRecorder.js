@@ -15,6 +15,9 @@ let audioChunks = [];
 let isRecording = false;
 let recordingStartTime = null;
 let recordingInterval = null;
+let silenceTimer = null;
+let silenceAudioContext = null;
+let continuousState = null;
 
 // Browser STT state
 let _recognition = null;
@@ -57,6 +60,14 @@ function _resetRecordingUI() {
   if (recordingInterval) {
     clearInterval(recordingInterval);
     recordingInterval = null;
+  }
+  if (silenceTimer) {
+    clearInterval(silenceTimer);
+    silenceTimer = null;
+  }
+  if (silenceAudioContext) {
+    silenceAudioContext.close().catch(() => {});
+    silenceAudioContext = null;
   }
   // Reset send button via global callback
   const sendBtn = document.querySelector('.send-btn');
@@ -127,6 +138,10 @@ async function transcribeOnServer(audioBlob) {
   return data.text || '';
 }
 
+function _stopTracks(stream) {
+  if (stream) stream.getTracks().forEach(track => track.stop());
+}
+
 /**
  * Insert transcribed text into the chat input
  */
@@ -148,7 +163,7 @@ function insertTranscription(text, showToast) {
 /**
  * Start voice recording
  */
-export function startRecording(onFileCreated, showToast, showError) {
+export function startRecording(onFileCreated, showToast, showError, options = {}) {
   // Check for secure context (getUserMedia requires HTTPS or localhost)
   if (!window.isSecureContext) {
     if (showError) showError('Microphone requires HTTPS. Use a reverse proxy with SSL or access via localhost.');
@@ -184,6 +199,7 @@ export function startRecording(onFileCreated, showToast, showError) {
           const transcript = stopBrowserSTT();
           if (transcript) {
             insertTranscription(transcript, showToast);
+            if (options.onTranscript) options.onTranscript(transcript);
           } else {
             if (showToast) showToast('No speech detected');
             const audioFile = new File([audioBlob], `voice-message-${Date.now()}.webm`, { type: 'audio/webm' });
@@ -196,6 +212,7 @@ export function startRecording(onFileCreated, showToast, showError) {
             const transcript = await transcribeOnServer(audioBlob);
             if (transcript) {
               insertTranscription(transcript, showToast);
+              if (options.onTranscript) options.onTranscript(transcript);
             } else {
               if (showToast) showToast('No speech detected');
             }
@@ -213,11 +230,53 @@ export function startRecording(onFileCreated, showToast, showError) {
         }
 
         _resetRecordingUI();
+        if (options.onStop) options.onStop();
       };
 
       mediaRecorder.start();
       isRecording = true;
       recordingStartTime = new Date();
+
+      if (options.autoStopOnSilence) {
+        try {
+          const AudioContext = window.AudioContext || window.webkitAudioContext;
+          silenceAudioContext = AudioContext ? new AudioContext() : null;
+          if (silenceAudioContext) {
+            const source = silenceAudioContext.createMediaStreamSource(stream);
+            const analyser = silenceAudioContext.createAnalyser();
+            analyser.fftSize = 1024;
+            source.connect(analyser);
+            const data = new Uint8Array(analyser.fftSize);
+            let speechStarted = false;
+            let quietSince = null;
+            const minMs = options.minRecordMs || 800;
+            const quietMs = options.silenceMs || 1200;
+            const maxMs = options.maxRecordMs || 20000;
+            const threshold = options.silenceThreshold || 0.025;
+            silenceTimer = setInterval(() => {
+              if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
+              analyser.getByteTimeDomainData(data);
+              let sum = 0;
+              for (let i = 0; i < data.length; i++) {
+                const v = (data[i] - 128) / 128;
+                sum += v * v;
+              }
+              const rms = Math.sqrt(sum / data.length);
+              const elapsed = Date.now() - recordingStartTime.getTime();
+              if (rms > threshold) {
+                speechStarted = true;
+                quietSince = null;
+              } else if (speechStarted && elapsed > minMs) {
+                if (!quietSince) quietSince = Date.now();
+                if (Date.now() - quietSince >= quietMs) stopRecording();
+              }
+              if (elapsed >= maxMs) stopRecording();
+            }, 200);
+          }
+        } catch (e) {
+          console.warn('Silence auto-stop unavailable:', e);
+        }
+      }
 
       // Start browser STT if that's the provider
       if (_sttProvider === 'browser') {
@@ -255,6 +314,345 @@ export function stopRecording() {
   }
 }
 
+export async function startContinuousRecording(showToast, showError, options = {}) {
+  if (!window.isSecureContext) {
+    if (showError) showError('Microphone requires HTTPS. Use a reverse proxy with SSL or access via localhost.');
+    return false;
+  }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    if (showError) showError('Microphone not supported in this browser.');
+    return false;
+  }
+
+  if (_sttProvider === 'disabled') {
+    if (showError) showError('Turn on Speech to Text before starting voice mode.');
+    return false;
+  }
+  if (_sttProvider === 'browser') {
+    if (showError) showError('Continuous voice mode needs local Whisper or an STT endpoint.');
+    return false;
+  }
+
+  if (continuousState?.active) return true;
+
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  const audioContext = AudioContext ? new AudioContext() : null;
+  if (!audioContext) {
+    _stopTracks(stream);
+    if (showError) showError('Audio analysis is not supported in this browser.');
+    return false;
+  }
+  if (audioContext.state === 'suspended') {
+    await audioContext.resume();
+  }
+
+  const analyser = audioContext.createAnalyser();
+  analyser.fftSize = 1024;
+  audioContext.createMediaStreamSource(stream).connect(analyser);
+
+  const mimeTypeCandidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/aac',
+  ];
+  const mimeType = mimeTypeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
+  const vadData = new Uint8Array(analyser.fftSize);
+  const useChunkedTranscription = options.chunkedTranscription === true;
+
+  continuousState = {
+    active: true,
+    stream,
+    audioContext,
+    analyser,
+    mimeType,
+    recorder: null,
+    vadData,
+    isSpeaking: false,
+    speechStarted: false,
+    quietSince: null,
+    noiseFloor: null,
+    noiseSamples: 0,
+    utteranceStartedAt: null,
+    chunkSeq: 0,
+    rollingChunks: [],
+    utteranceChunks: [],
+    maxPreludeChunks: options.preludeChunks || 4,
+    segmentMs: 0,
+    segmentTimer: null,
+    finalizeTimer: null,
+    vadTimer: null,
+    transcribeCount: 0,
+    options,
+    showToast,
+    showError,
+  };
+
+  const maxUtteranceMs = options.maxUtteranceMs || 30000;
+
+  if (useChunkedTranscription) {
+    _startContinuousChunking(options.continuousChunkMs || 3500);
+  } else {
+    // VAD (silence-based) mode: capture audio in short rotating ticks (same
+    // Safari-safe stop()-per-tick approach as chunked mode) purely to keep a
+    // rolling buffer; the VAD loop below decides when an utterance actually
+    // starts/ends based on real silence, not a fixed clock — so a whole
+    // sentence accumulates before anything is sent, instead of each ~3.5s
+    // window being treated as a complete thought.
+    _startTickCapture(options.tickMs || 500);
+    _startContinuousVad(maxUtteranceMs);
+  }
+  if (showToast) showToast('Voice mode listening...');
+  return true;
+}
+
+function _startTickCapture(tickMs) {
+  const st = continuousState;
+  if (!st?.active) return;
+
+  const chunks = [];
+  const recorder = st.mimeType ? new MediaRecorder(st.stream, { mimeType: st.mimeType }) : new MediaRecorder(st.stream);
+  st.recorder = recorder;
+
+  recorder.ondataavailable = (event) => {
+    if (event.data.size > 0) chunks.push(event.data);
+  };
+  recorder.onerror = (event) => {
+    console.error('Continuous recorder error:', event.error || event);
+    if (st.showError) st.showError('Voice mode recorder error.');
+    stopContinuousRecording();
+  };
+  recorder.onstop = () => {
+    if (continuousState !== st || !st.active) return;
+    let chunkSize = 0;
+    chunks.forEach((blob) => {
+      chunkSize += blob.size;
+      const item = { blob, seq: ++st.chunkSeq };
+      st.rollingChunks.push(item);
+      if (st.rollingChunks.length > st.maxPreludeChunks) st.rollingChunks.shift();
+      if (st.speechStarted) st.utteranceChunks.push(item);
+    });
+    if (chunkSize && st.options.onAudioChunk) st.options.onAudioChunk(chunkSize);
+    _startTickCapture(tickMs);
+  };
+
+  recorder.start();
+  st.segmentTimer = setTimeout(() => {
+    if (st.recorder === recorder && recorder.state === 'recording') {
+      try { recorder.stop(); } catch (e) { /* ignore */ }
+    }
+  }, tickMs);
+}
+
+// Records one fixed-length segment with a dedicated MediaRecorder, then (if
+// still active) immediately starts the next one. A single long-lived
+// recorder driven by start(timeslice)/requestData() doesn't reliably flush
+// periodic `dataavailable` chunks in Safari, so continuous mode captured
+// zero audio there even though the UI looked active. stop() is
+// spec-guaranteed to flush all buffered data in every browser, and a fresh
+// recorder per segment also means each segment is a complete,
+// independently-decodable file (no fragmented-container-header problem on
+// segments after the first, which a shared-recorder approach has for
+// container formats like mp4).
+function _startContinuousChunking(segmentMs) {
+  const st = continuousState;
+  if (!st) return;
+  st.segmentMs = segmentMs;
+  _recordNextSegment();
+}
+
+function _recordNextSegment() {
+  const st = continuousState;
+  if (!st?.active) return;
+
+  const chunks = [];
+  const recorder = st.mimeType ? new MediaRecorder(st.stream, { mimeType: st.mimeType }) : new MediaRecorder(st.stream);
+  st.recorder = recorder;
+
+  recorder.ondataavailable = (event) => {
+    if (event.data.size > 0) chunks.push(event.data);
+  };
+  recorder.onerror = (event) => {
+    console.error('Continuous recorder error:', event.error || event);
+    if (st.showError) st.showError('Voice mode recorder error.');
+    stopContinuousRecording();
+  };
+  recorder.onstop = () => {
+    if (chunks.length && st.options.onAudioChunk) {
+      st.options.onAudioChunk(chunks.reduce((n, c) => n + c.size, 0));
+    }
+    _finalizeContinuousSegment(st, chunks, recorder.mimeType || st.mimeType);
+    if (st.active && continuousState === st) _recordNextSegment();
+  };
+
+  recorder.start();
+  st.segmentTimer = setTimeout(() => {
+    if (st.recorder === recorder && recorder.state === 'recording') {
+      try { recorder.stop(); } catch (e) { /* ignore */ }
+    }
+  }, st.segmentMs);
+}
+
+function _finalizeContinuousSegment(st, chunks, mimeType) {
+  if (!chunks || !chunks.length) return;
+
+  const audioBlob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+  st.transcribeCount += 1;
+  if (st.options.onTranscriptionStart) st.options.onTranscriptionStart(st.transcribeCount);
+
+  transcribeOnServer(audioBlob)
+    .then((text) => {
+      if (continuousState !== st) return;
+      const trimmed = (text || '').trim();
+      if (trimmed) {
+        if (st.options.onSpeechStart) st.options.onSpeechStart();
+        if (st.options.onTranscript) st.options.onTranscript(trimmed);
+        if (st.options.onSpeechEnd) st.options.onSpeechEnd();
+      }
+    })
+    .catch((e) => {
+      console.error('Continuous STT transcription error:', e);
+      if (st.showError) st.showError('Transcription failed: ' + e.message);
+    })
+    .finally(() => {
+      if (continuousState === st && st.options.onTranscriptionEnd) st.options.onTranscriptionEnd();
+    });
+}
+
+function _startContinuousVad(maxUtteranceMs) {
+  const st = continuousState;
+  if (!st) return;
+
+  const minSpeechMs = st.options.minSpeechMs || 350;
+  const silenceMs = st.options.silenceMs || 8000;
+  const manualThreshold = Number(st.options.silenceThreshold || 0);
+  const minThreshold = Number(st.options.minSilenceThreshold || 0.010);
+  const thresholdMultiplier = Number(st.options.thresholdMultiplier || 3.25);
+
+  let loudSince = null;
+  st.vadTimer = setInterval(() => {
+    const current = continuousState;
+    if (!current?.active) return;
+
+    current.analyser.getByteTimeDomainData(current.vadData);
+    let sum = 0;
+    for (let i = 0; i < current.vadData.length; i++) {
+      const v = (current.vadData[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / current.vadData.length);
+    const now = Date.now();
+    if (!current.speechStarted && !loudSince) {
+      if (current.noiseFloor == null) current.noiseFloor = rms;
+      else current.noiseFloor = current.noiseFloor * 0.92 + rms * 0.08;
+      current.noiseSamples += 1;
+    }
+
+    const adaptiveThreshold = Math.max(
+      minThreshold,
+      current.noiseFloor == null ? minThreshold : current.noiseFloor * thresholdMultiplier
+    );
+    const threshold = manualThreshold > 0 ? manualThreshold : adaptiveThreshold;
+    const loud = rms > threshold;
+    if (current.options.onVadLevel) current.options.onVadLevel({ rms, threshold, loud, speaking: current.speechStarted });
+
+    if (loud) {
+      if (current.finalizeTimer) {
+        clearTimeout(current.finalizeTimer);
+        current.finalizeTimer = null;
+      }
+      if (!loudSince) loudSince = now;
+      current.quietSince = null;
+      if (!current.speechStarted && now - loudSince >= minSpeechMs) {
+        current.speechStarted = true;
+        current.isSpeaking = true;
+        current.utteranceStartedAt = now;
+        const seen = new Set(current.utteranceChunks.map(chunk => chunk.seq));
+        const prelude = current.rollingChunks.filter(chunk => !seen.has(chunk.seq));
+        current.utteranceChunks = prelude.concat(current.utteranceChunks);
+        if (current.options.onSpeechStart) current.options.onSpeechStart();
+      }
+      return;
+    }
+
+    loudSince = null;
+    if (!current.speechStarted) return;
+
+    if (!current.quietSince) current.quietSince = now;
+    const utteranceAge = current.utteranceStartedAt ? now - current.utteranceStartedAt : 0;
+    if ((now - current.quietSince >= silenceMs || utteranceAge >= maxUtteranceMs) && !current.finalizeTimer) {
+      // No requestData() needed — _startTickCapture's rotating recorders
+      // already flush continuously, so utteranceChunks is already current.
+      current.finalizeTimer = setTimeout(() => {
+        if (continuousState) continuousState.finalizeTimer = null;
+        _finalizeContinuousUtterance();
+      }, 120);
+    }
+  }, 100);
+}
+
+function _finalizeContinuousUtterance() {
+  const st = continuousState;
+  if (!st?.active || !st.speechStarted) return;
+
+  const chunks = st.utteranceChunks.map(item => item.blob);
+  st.speechStarted = false;
+  st.isSpeaking = false;
+  st.quietSince = null;
+  st.utteranceStartedAt = null;
+  st.utteranceChunks = [];
+  st.rollingChunks = [];
+
+  if (st.options.onSpeechEnd) st.options.onSpeechEnd();
+  if (!chunks.length) return;
+
+  const audioBlob = new Blob(chunks, { type: st.mimeType || 'audio/webm' });
+  st.transcribeCount += 1;
+  if (st.options.onTranscriptionStart) st.options.onTranscriptionStart(st.transcribeCount);
+
+  transcribeOnServer(audioBlob)
+    .then((text) => {
+      if (!continuousState?.active) return;
+      const trimmed = (text || '').trim();
+      if (trimmed && st.options.onTranscript) st.options.onTranscript(trimmed);
+      else if (st.showToast) st.showToast('No speech detected');
+    })
+    .catch((e) => {
+      console.error('Continuous STT transcription error:', e);
+      if (st.showError) st.showError('Transcription failed: ' + e.message);
+    })
+    .finally(() => {
+      if (continuousState?.active && st.options.onTranscriptionEnd) st.options.onTranscriptionEnd();
+    });
+}
+
+export function stopContinuousRecording() {
+  const st = continuousState;
+  if (!st) return;
+  st.active = false;
+  if (st.vadTimer) clearInterval(st.vadTimer);
+  if (st.segmentTimer) clearTimeout(st.segmentTimer);
+  if (st.finalizeTimer) clearTimeout(st.finalizeTimer);
+  // Flush whatever the current segment/utterance recorder has buffered so
+  // far — stop() fires its onstop handler asynchronously, which still runs
+  // (and transcribes) after continuousState is nulled below.
+  if (st.recorder && st.recorder.state !== 'inactive') {
+    try { st.recorder.stop(); } catch (e) { /* ignore */ }
+  }
+  if (st.speechStarted) {
+    try { _finalizeContinuousUtterance(); } catch (e) { console.warn('Failed to finalize utterance:', e); }
+  }
+  _stopTracks(st.stream);
+  if (st.audioContext) st.audioContext.close().catch(() => {});
+  continuousState = null;
+}
+
+export function getIsContinuousRecording() {
+  return !!continuousState?.active;
+}
+
 /**
  * Check if currently recording
  */
@@ -273,6 +671,9 @@ export function init() {
 const voiceRecorderModule = {
   startRecording,
   stopRecording,
+  startContinuousRecording,
+  stopContinuousRecording,
+  getIsContinuousRecording,
   getIsRecording,
   init,
   refreshSttProvider,

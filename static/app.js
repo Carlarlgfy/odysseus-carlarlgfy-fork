@@ -3518,7 +3518,8 @@ function startOdysseusApp() {
   let _submitting = false;
 
   function handleSubmit(e) {
-    if (e) e.preventDefault();
+    const submitEvent = e || { preventDefault() {} };
+    submitEvent.preventDefault();
     // Debounce: prevent double-submit while a request is being initiated
     if (_submitting) return;
     _submitting = true;
@@ -3527,7 +3528,7 @@ function startOdysseusApp() {
 
     // Compare mode: route submit to compare handler (same message to all panes)
     if (compareModule && compareModule.isActive()) {
-      return compareModule.handleCompareSubmit(e);
+      return compareModule.handleCompareSubmit(submitEvent);
     }
 
     // Group chat: route to group module
@@ -3544,7 +3545,7 @@ function startOdysseusApp() {
       return;
     }
 
-    return originalSubmit.call(chatModule, e);
+    return originalSubmit.call(chatModule, submitEvent);
   }
 
   chatForm.onsubmit = handleSubmit;
@@ -3740,6 +3741,156 @@ function startOdysseusApp() {
       _syncModelPickerAutohide();
       _debouncedUpdateIcon();
     }, { passive: true });
+  }
+
+  // ── Continuous voice conversation loop ──
+  (function initVoiceLoop() {
+    const loopBtns = [
+      document.getElementById('voice-loop-btn'),
+      document.getElementById('overflow-voice-loop-btn')
+    ].filter(Boolean);
+    if (!loopBtns.length || !messageInput) return;
+
+    let active = false;
+    let chatBusy = false;
+    let pendingTranscriptions = 0;
+    const transcriptQueue = [];
+
+    function setActive(next) {
+      active = !!next;
+      loopBtns.forEach((btn) => {
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+        btn.title = active ? 'Stop continuous voice conversation' : 'Start continuous voice conversation';
+      });
+      if (window.aiTTSManager) window.aiTTSManager.autoPlay = active;
+      if (!active) {
+        chatBusy = false;
+        pendingTranscriptions = 0;
+        transcriptQueue.length = 0;
+        if (voiceRecorderModule.getIsContinuousRecording && voiceRecorderModule.getIsContinuousRecording()) {
+          voiceRecorderModule.stopContinuousRecording();
+        }
+        if (window.aiTTSManager) window.aiTTSManager.stop();
+      }
+      // updatePlusDot is local to initializeEventListeners() (this IIFE runs
+      // outside that scope) — guard like the other out-of-scope call site
+      // above, since an unguarded call throws and aborts setActive() before
+      // startListening() ever runs (recording silently never starts).
+      if (typeof updatePlusDot === 'function') updatePlusDot();
+    }
+
+    function markRecordingUI() {
+      loopBtns.forEach((btn) => btn.classList.add('recording'));
+    }
+
+    function clearRecordingUI() {
+      loopBtns.forEach((btn) => btn.classList.remove('recording'));
+    }
+
+    function setTranscribing(isTranscribing) {
+      loopBtns.forEach((btn) => btn.classList.toggle('transcribing', !!isTranscribing));
+    }
+
+    function enqueueTranscript(text) {
+      const cleaned = (text || '').trim();
+      if (!cleaned) return;
+      transcriptQueue.push(cleaned);
+      uiModule.showToast(chatBusy ? 'Queued voice transcript' : 'Transcribed');
+      processTranscriptQueue();
+    }
+
+    function processTranscriptQueue() {
+      if (!active || chatBusy || transcriptQueue.length === 0) return;
+      if (sendBtn && sendBtn.dataset.mode === 'streaming') return;
+
+      const next = transcriptQueue.shift();
+      messageInput.value = next;
+      messageInput.dispatchEvent(new Event('input', { bubbles: true }));
+      chatBusy = true;
+      handleSubmit();
+    }
+
+    async function startListening() {
+      if (!active || (voiceRecorderModule.getIsContinuousRecording && voiceRecorderModule.getIsContinuousRecording())) return;
+      if (!_isSttEnabled()) {
+        uiModule.showError('Turn on Speech to Text before starting voice loop.');
+        setActive(false);
+        return;
+      }
+
+      if (messageInput.value.trim()) messageInput.value = '';
+      messageInput.dispatchEvent(new Event('input', { bubbles: true }));
+
+      try {
+        let audioChunkCount = 0;
+        const started = await voiceRecorderModule.startContinuousRecording(
+          uiModule.showToast,
+          uiModule.showError,
+          {
+            chunkedTranscription: false,
+            silenceMs: 8000,
+            minSilenceThreshold: 0.010,
+            thresholdMultiplier: 3.25,
+            onAudioChunk: () => {
+              audioChunkCount += 1;
+              if (audioChunkCount <= 3) uiModule.showToast('Audio captured...');
+            },
+            onSpeechStart: () => {
+              markRecordingUI();
+              uiModule.showToast('Speech detected...');
+            },
+            onSpeechEnd: () => {
+              clearRecordingUI();
+              uiModule.showToast('Transcribing...');
+            },
+            onTranscriptionStart: () => {
+              pendingTranscriptions += 1;
+              setTranscribing(true);
+            },
+            onTranscriptionEnd: () => {
+              pendingTranscriptions = Math.max(0, pendingTranscriptions - 1);
+              setTranscribing(pendingTranscriptions > 0);
+            },
+            onTranscript: enqueueTranscript,
+          }
+        );
+        if (!started) setActive(false);
+      } catch (e) {
+        console.error('Voice mode failed to start:', e);
+        uiModule.showError('Voice mode failed to start: ' + e.message);
+        setActive(false);
+      }
+    }
+
+    loopBtns.forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        setActive(!active);
+        if (active) startListening();
+      });
+    });
+
+    window.addEventListener('odysseus:assistant-response-complete', () => {
+      if (!active) return;
+      chatBusy = false;
+      setTimeout(processTranscriptQueue, 150);
+    });
+
+    window.addEventListener('odysseus:tts-idle', () => {
+      if (!active) return;
+      processTranscriptQueue();
+    });
+  })();
+
+  const voiceLibraryBtn = document.getElementById('voice-library-btn');
+  if (voiceLibraryBtn) {
+    voiceLibraryBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (settingsModule && typeof settingsModule.openVoiceLibrary === 'function') {
+        settingsModule.openVoiceLibrary();
+      }
+    });
   }
 
   // Collapse "New Session" label on scroll

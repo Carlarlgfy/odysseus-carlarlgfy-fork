@@ -555,6 +555,13 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
     // Declare accumulated outside try block so it's accessible in catch
     let accumulated = '';
+    // Voice loop (app.js) listens for odysseus:assistant-response-complete to
+    // know when it's safe to submit the next queued transcript. The success
+    // path dispatches it directly; these flags let the `finally` block below
+    // dispatch it for every error/abort/timeout path too, so a failed turn
+    // doesn't leave continuous voice mode permanently stuck waiting.
+    let _voiceCompleteDispatched = false;
+    let _voiceRecoveryInFlight = false;
     // Are we currently inside an unclosed <think> block? Toggled per think/answer
     // cycle so a multi-round agent response (one reasoning phase PER round) wraps each
     // round's reasoning in its own <think>…</think> instead of leaking rounds 2+ as text.
@@ -2758,6 +2765,10 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
             }
           }
         }
+        window.dispatchEvent(new CustomEvent('odysseus:assistant-response-complete', {
+          detail: { text: accumulated || '' }
+        }));
+        _voiceCompleteDispatched = true;
         if (metrics) {
           displayMetrics(footerTarget, metrics);
         }
@@ -2961,7 +2972,12 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           // cap. Only auto-recover from connection-class failures; deterministic
           // errors (unsupported tools, 4xx/5xx, parse failures) surface right away
           // instead of burning the nudge budget on a guaranteed-to-fail retry.
-          if (!(_isRecoverableStreamErr(err) && _tryAutoRecover(holder, accumulated, streamSessionId))) {
+          const _recovered = _isRecoverableStreamErr(err) && _tryAutoRecover(holder, accumulated, streamSessionId);
+          if (_recovered) {
+            // A retry is already scheduled (see _tryAutoRecover) — the turn
+            // isn't actually over yet, so don't tell the voice loop to move on.
+            _voiceRecoveryInFlight = true;
+          } else {
             const errorHolder = document.querySelector('.msg-ai:last-of-type .body');
             if (errorHolder) {
               let errMsg = `Error: ${err.message}`;
@@ -2989,6 +3005,18 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
       // Only reset UI state if still on the stream's session and was never backgrounded
       const _isBgFinally = (sessionModule.getCurrentSessionId() !== streamSessionId) || _backgroundStreams.has(streamSessionId);
+
+      // The success path dispatches odysseus:assistant-response-complete itself.
+      // Every other exit (timeout, offline, user-stop, unrecovered error) lands
+      // here without having dispatched it — without this, the voice loop's
+      // chatBusy flag never clears and continuous mode silently stalls forever
+      // after the first hiccup. Skip only if already dispatched, or if a
+      // silent auto-recovery retry is about to resubmit (turn isn't over yet).
+      if (!_voiceCompleteDispatched && !_voiceRecoveryInFlight && !_isBgFinally) {
+        window.dispatchEvent(new CustomEvent('odysseus:assistant-response-complete', {
+          detail: { text: accumulated || '', error: true }
+        }));
+      }
 
       if (!_isBgFinally) {
         // Reset button to idle state

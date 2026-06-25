@@ -14,15 +14,18 @@
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_NAME="Odysseus"
+APP_NAME="${APP_NAME:-Odysseus}"
+BUNDLE_ID="${BUNDLE_ID:-com.odysseus.launcher}"
 INSTALL_DIR="$REPO_DIR"
 PORT="${ODYSSEUS_PORT:-7860}"
+APP_DATA_DIR="${ODYSSEUS_APP_DATA_DIR:-}"
 DIST="$REPO_DIR/dist"
 APP="$DIST/$APP_NAME.app"
 
 echo "Building $APP_NAME.app"
 echo "  install dir: $INSTALL_DIR"
 echo "  port:        $PORT"
+[ -n "$APP_DATA_DIR" ] && echo "  data dir:    $APP_DATA_DIR"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -53,7 +56,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <dict>
     <key>CFBundleName</key>            <string>$APP_NAME</string>
     <key>CFBundleDisplayName</key>     <string>$APP_NAME</string>
-    <key>CFBundleIdentifier</key>      <string>com.odysseus.launcher</string>
+    <key>CFBundleIdentifier</key>      <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>         <string>1.0</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
@@ -61,7 +64,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key>        <string>odysseus</string>
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
     <key>NSHighResolutionCapable</key> <true/>
-    <key>LSUIElement</key>             <false/>
+    <key>LSUIElement</key>             <true/>
 </dict>
 </plist>
 PLIST
@@ -72,11 +75,16 @@ cat > "$APP/Contents/MacOS/$APP_NAME.tmpl" <<'LAUNCHER'
 # Odysseus.app — start the local server and open the UI in an app window.
 INSTALL_DIR="__INSTALL_DIR__"
 PORT="__PORT__"
+APP_DATA_DIR="__APP_DATA_DIR__"
 URL="http://127.0.0.1:${PORT}"
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+if [ -n "$APP_DATA_DIR" ]; then
+  export ODYSSEUS_DATA_DIR="$APP_DATA_DIR"
+fi
 
 UVICORN="$INSTALL_DIR/venv/bin/uvicorn"
 LOG="$INSTALL_DIR/logs/odysseus-app.log"
+PID_FILE="$INSTALL_DIR/logs/odysseus-app.pid"
 
 notify() { /usr/bin/osascript -e "display notification \"$1\" with title \"Odysseus\"" >/dev/null 2>&1; }
 die_gui() {
@@ -91,7 +99,8 @@ python3.11 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 ./venv/bin/python setup.py"
 
-# Open the UI in a chrome-less app window (Chromium browsers), else default browser.
+# Open the UI in its own window. Chromium browsers get app mode; Safari needs
+# AppleScript because `open URL` reuses an existing browser window as a tab.
 open_ui() {
   local b base exe bin
   for b in "Google Chrome" "Microsoft Edge" "Brave Browser" "Chromium"; do
@@ -106,10 +115,20 @@ open_ui() {
       fi
     done
   done
-  /usr/bin/open "$URL"
+  if [ -d "/Applications/Safari.app" ]; then
+    /usr/bin/osascript >/dev/null 2>&1 <<OSA
+tell application "Safari"
+  activate
+  make new document with properties {URL:"$URL"}
+end tell
+OSA
+    return 0
+  fi
+  /usr/bin/open -n "$URL"
 }
 
 mkdir -p "$INSTALL_DIR/logs"
+[ -n "$APP_DATA_DIR" ] && mkdir -p "$APP_DATA_DIR"
 
 # Already running? Just open the UI.
 if /usr/bin/curl -s -o /dev/null --max-time 2 "$URL"; then
@@ -120,21 +139,26 @@ fi
 notify "Starting…"
 cd "$INSTALL_DIR" || die_gui "Install folder not found: $INSTALL_DIR"
 if [ "$(uname -m)" = "arm64" ]; then
-  arch -arm64 "$UVICORN" app:app --host 127.0.0.1 --port "$PORT" >>"$LOG" 2>&1 &
+  nohup arch -arm64 "$UVICORN" app:app --host 127.0.0.1 --port "$PORT" >>"$LOG" 2>&1 &
 else
-  "$UVICORN" app:app --host 127.0.0.1 --port "$PORT" >>"$LOG" 2>&1 &
+  nohup "$UVICORN" app:app --host 127.0.0.1 --port "$PORT" >>"$LOG" 2>&1 &
 fi
 SERVER_PID=$!
-
-# Quitting the app stops the server it started.
-trap 'kill $SERVER_PID 2>/dev/null; exit 0' TERM INT
+echo "$SERVER_PID" > "$PID_FILE"
 
 # Wait for readiness (first run downloads an embedding model — allow ~2 min).
 READY=0
 for i in $(seq 1 120); do
   /usr/bin/curl -s -o /dev/null --max-time 2 "$URL" && { READY=1; break; }
-  kill -0 "$SERVER_PID" 2>/dev/null || die_gui "Odysseus failed to start. Log:
-$LOG"
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    LAST_LOG="$(tail -n 40 "$LOG" 2>/dev/null)"
+    die_gui "Odysseus failed to start.
+
+Log:
+$LOG
+
+$LAST_LOG"
+  fi
   sleep 1
 done
 
@@ -143,10 +167,10 @@ if [ "$READY" = "1" ]; then
 else
   notify "Odysseus is taking a while — open $URL once it finishes starting."
 fi
-wait "$SERVER_PID"
+exit 0
 LAUNCHER
 
-sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" -e "s|__PORT__|$PORT|g" \
+sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" -e "s|__PORT__|$PORT|g" -e "s|__APP_DATA_DIR__|$APP_DATA_DIR|g" \
     "$APP/Contents/MacOS/$APP_NAME.tmpl" > "$APP/Contents/MacOS/$APP_NAME"
 rm -f "$APP/Contents/MacOS/$APP_NAME.tmpl"
 chmod +x "$APP/Contents/MacOS/$APP_NAME"
@@ -161,13 +185,22 @@ mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DIST/$APP_NAME.dmg"
-hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DIST/$APP_NAME.dmg" >/dev/null
+if hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DIST/$APP_NAME.dmg" >/dev/null; then
+  DMG_CREATED=1
+else
+  DMG_CREATED=0
+  echo "  dmg:         skipped (hdiutil failed)"
+fi
 rm -rf "$STAGE"
 
 echo ""
 echo "Done:"
 echo "  $APP"
-echo "  $DIST/$APP_NAME.dmg"
+if [ "$DMG_CREATED" = "1" ]; then
+  echo "  $DIST/$APP_NAME.dmg"
+fi
 echo ""
 echo "Run it:        open '$APP'"
-echo "Install:       open '$DIST/$APP_NAME.dmg'  (drag Odysseus to Applications)"
+if [ "$DMG_CREATED" = "1" ]; then
+  echo "Install:       open '$DIST/$APP_NAME.dmg'  (drag Odysseus to Applications)"
+fi

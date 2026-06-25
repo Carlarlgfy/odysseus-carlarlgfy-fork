@@ -1051,6 +1051,11 @@
                 <span>TTS Mode</span>
                 <span class="overflow-active-dot"></span>
               </button>
+              <button type="button" class="overflow-menu-item" id="overflow-voice-loop-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                <span>Voice loop</span>
+                <span class="overflow-active-dot"></span>
+              </button>
               <button type="button" class="overflow-menu-item" id="overflow-preset-btn">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="m18 2 4 4"/><path d="m17 7 3-3"/><path d="M19 9 8.7 19.3c-1 1-2.5 1-3.4 0l-.6-.6c-1-1-1-2.5 0-3.4L15 5"/><path d="m9 11 4 4"/><path d="m5 19-3 3"/><path d="m14 4 6 6"/>
@@ -1111,6 +1116,12 @@
             <button type="button" class="mode-toggle-btn active" id="mode-agent-btn" aria-pressed="true">Agent</button>
             <button type="button" class="mode-toggle-btn" id="mode-chat-btn" aria-pressed="false">Chat</button>
           </div>
+          <button type="button" class="input-icon-btn voice-loop-btn" id="voice-loop-btn" title="Start continuous voice conversation" aria-label="Start continuous voice conversation" aria-pressed="false">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          </button>
+          <button type="button" class="input-icon-btn" id="voice-library-btn" title="Voice library" aria-label="Voice library">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M16 9a4 4 0 0 1 0 6"/><path d="M19 6a8 8 0 0 1 0 12"/><path d="M4 4h4"/><path d="M4 20h4"/></svg>
+          </button>
           <button type="submit" form="chat-form" class="send-btn newchat-mode" data-mode="newchat" aria-label="New chat">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span class="send-btn-label">+ New</span>
           </button>
@@ -1515,6 +1526,7 @@
                 <select id="set-ttsProviderSelect" class="settings-select">
                   <option value="disabled">Disabled</option>
                   <option value="browser">Browser (built-in)</option>
+                  <option value="piper">Piper (local)</option>
                   <option value="local">Local (Kokoro-82M)</option>
                 </select>
               </div>
@@ -2354,6 +2366,6 @@
 <script type="module" src="/static/app.js"></script>  <!-- app.js must be LAST -->
 <script type="module" src="/static/js/init.js"></script>
 <script type="module" src="/static/js/a11y.js"></script>
-<script nonce="{{CSP_NONCE}}">if('serviceWorker' in navigator){navigator.serviceWorker.register('/static/sw.js').catch(()=>{});}</script>
+<script nonce="{{CSP_NONCE}}">if('serviceWorker' in navigator){navigator.serviceWorker.register('/static/sw.js').then(function(reg){if(reg)reg.update();}).catch(()=>{});}</script>
 </body>
 </html>

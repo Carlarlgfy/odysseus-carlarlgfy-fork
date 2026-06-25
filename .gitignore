@@ -89,3 +89,7 @@ docs/windows-port/
 compound.config.json
 *.error.log
 _scratch/
+venv/
+data-voice-test/
+docs/obsidian-vault/
+venv
