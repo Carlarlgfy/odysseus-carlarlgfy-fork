@@ -2,6 +2,7 @@
 """STT API routes — multi-provider (local Whisper, API endpoint, browser)."""
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi.concurrency import run_in_threadpool
 import logging
 
 from src.upload_limits import read_upload_limited, STT_MAX_AUDIO_BYTES
@@ -36,7 +37,7 @@ def setup_stt_routes(stt_service):
             if not audio_bytes:
                 raise HTTPException(status_code=400, detail={"message": "Empty audio file"})
 
-            text = stt_service.transcribe(audio_bytes)
+            text = await run_in_threadpool(stt_service.transcribe, audio_bytes)
             if text is None:
                 raise HTTPException(
                     status_code=500,

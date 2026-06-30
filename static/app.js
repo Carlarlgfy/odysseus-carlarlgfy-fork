@@ -482,6 +482,25 @@ function initializeEventListeners() {
   
 
 
+  // Volume keys (hardware media keys on Mac keyboard)
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'AudioVolumeMute' && e.key !== 'AudioVolumeDown' && e.key !== 'AudioVolumeUp') return;
+    e.preventDefault();
+    const tts = window.aiTTSManager;
+    if (!tts) return;
+    if (e.key === 'AudioVolumeMute') {
+      tts.toggleMute();
+      uiModule.showToast(tts.muted ? 'TTS muted' : `TTS unmuted — ${Math.round(tts.volume * 100)}%`);
+    } else if (e.key === 'AudioVolumeDown') {
+      tts.adjustVolume(-0.1);
+      uiModule.showToast(`Volume: ${Math.round(tts.volume * 100)}%`);
+    } else if (e.key === 'AudioVolumeUp') {
+      const before = tts.volume;
+      tts.adjustVolume(0.1);
+      uiModule.showToast(tts.volume === before ? 'Volume at max' : `Volume: ${Math.round(tts.volume * 100)}%`);
+    }
+  }, true);
+
   // Close popups one by one with Escape key (topmost first)
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
@@ -3753,8 +3772,44 @@ function startOdysseusApp() {
 
     let active = false;
     let chatBusy = false;
+    let chatBusySince = 0;
+    let ttsBusy = false;
+    let ttsWatchdog = null;
+    let queueDrainTimer = null;
     let pendingTranscriptions = 0;
     const transcriptQueue = [];
+    const TTS_SUPPRESS_WATCHDOG_MS = 30000;
+    const CHAT_BUSY_TIMEOUT_MS = 60000;
+
+    function clearTtsWatchdog() {
+      if (ttsWatchdog) {
+        clearTimeout(ttsWatchdog);
+        ttsWatchdog = null;
+      }
+    }
+
+    function clearChatBusy() {
+      chatBusy = false;
+      chatBusySince = 0;
+    }
+
+    function startQueueDrain() {
+      if (queueDrainTimer) return;
+      queueDrainTimer = setInterval(() => {
+        const streaming = sendBtn && sendBtn.dataset.mode === 'streaming';
+        if (active && chatBusy && chatBusySince && !streaming && Date.now() - chatBusySince > CHAT_BUSY_TIMEOUT_MS) {
+          clearChatBusy();
+        }
+        if (active && transcriptQueue.length > 0) processTranscriptQueue();
+      }, 1000);
+    }
+
+    function stopQueueDrain() {
+      if (queueDrainTimer) {
+        clearInterval(queueDrainTimer);
+        queueDrainTimer = null;
+      }
+    }
 
     function setActive(next) {
       active = !!next;
@@ -3764,8 +3819,13 @@ function startOdysseusApp() {
         btn.title = active ? 'Stop continuous voice conversation' : 'Start continuous voice conversation';
       });
       if (window.aiTTSManager) window.aiTTSManager.autoPlay = active;
-      if (!active) {
-        chatBusy = false;
+      if (active) {
+        startQueueDrain();
+      } else {
+        clearChatBusy();
+        ttsBusy = false;
+        clearTtsWatchdog();
+        stopQueueDrain();
         pendingTranscriptions = 0;
         transcriptQueue.length = 0;
         if (voiceRecorderModule.getIsContinuousRecording && voiceRecorderModule.getIsContinuousRecording()) {
@@ -3792,23 +3852,53 @@ function startOdysseusApp() {
       loopBtns.forEach((btn) => btn.classList.toggle('transcribing', !!isTranscribing));
     }
 
+    // Whisper hallucinations produced on near-silence or short noise bursts
+    const WHISPER_HALLUCINATIONS = new Set([
+      'thank you', 'thanks', 'thank you.', 'thanks.', 'bye', 'bye.', 'bye bye',
+      'merci', 'merci.', 'au revoir', 'bonjour', 'bonsoir', 'sous-titres', 'sous-titres réalisés',
+      'you', 'you.', '.', '...', '…', 'uh', 'um', 'hmm', 'hm',
+    ]);
+
     function enqueueTranscript(text) {
       const cleaned = (text || '').trim();
       if (!cleaned) return;
+      if (cleaned.length < 2) return;
+      // Drop punctuation-only results
+      if (/^[\s\p{P}]+$/u.test(cleaned)) return;
+      // Drop known Whisper hallucinations on silence
+      if (WHISPER_HALLUCINATIONS.has(cleaned.toLowerCase())) return;
       transcriptQueue.push(cleaned);
-      uiModule.showToast(chatBusy ? 'Queued voice transcript' : 'Transcribed');
+      uiModule.showToast((chatBusy || ttsBusy) ? 'Queued voice transcript' : 'Transcribed');
       processTranscriptQueue();
     }
 
     function processTranscriptQueue() {
-      if (!active || chatBusy || transcriptQueue.length === 0) return;
+      if (!active || chatBusy || ttsBusy || transcriptQueue.length === 0) return;
       if (sendBtn && sendBtn.dataset.mode === 'streaming') return;
 
       const next = transcriptQueue.shift();
       messageInput.value = next;
       messageInput.dispatchEvent(new Event('input', { bubbles: true }));
       chatBusy = true;
+      chatBusySince = Date.now();
       handleSubmit();
+
+      // Safety net: if handleChatSubmit returns early (session not found, no
+      // default model configured, etc.) it calls _releaseSendFlag() but never
+      // dispatches odysseus:assistant-response-complete, so chatBusy stays true
+      // for the full 60 s watchdog window. Detect the silent-failure case:
+      // streaming didn't start within 2 s → clear chatBusy so the next utterance
+      // isn't blocked.
+      const _stamp = chatBusySince;
+      setTimeout(() => {
+        if (!active || chatBusySince !== _stamp || !chatBusy) return;
+        const streaming = sendBtn && sendBtn.dataset.mode === 'streaming';
+        if (!streaming) {
+          console.warn('[voice] submit did not start streaming — releasing chatBusy');
+          clearChatBusy();
+          setTimeout(processTranscriptQueue, 0);
+        }
+      }, 2000);
     }
 
     async function startListening() {
@@ -3824,21 +3914,23 @@ function startOdysseusApp() {
 
       try {
         let audioChunkCount = 0;
+        let vadDebugLast = 0;
         const started = await voiceRecorderModule.startContinuousRecording(
           uiModule.showToast,
           uiModule.showError,
           {
             chunkedTranscription: false,
-            silenceMs: 8000,
-            minSilenceThreshold: 0.010,
-            thresholdMultiplier: 3.25,
+            silenceMs: 2500,
+            minSpeechMs: 200,
+            thresholdMultiplier: 2.4,
+            maxSilenceThreshold: 0.055,
             onAudioChunk: () => {
               audioChunkCount += 1;
-              if (audioChunkCount <= 3) uiModule.showToast('Audio captured...');
+              if (audioChunkCount <= 3) uiModule.showToast('Listening...');
             },
             onSpeechStart: () => {
               markRecordingUI();
-              uiModule.showToast('Speech detected...');
+              uiModule.showToast('Listening...');
             },
             onSpeechEnd: () => {
               clearRecordingUI();
@@ -3852,6 +3944,14 @@ function startOdysseusApp() {
               pendingTranscriptions = Math.max(0, pendingTranscriptions - 1);
               setTranscribing(pendingTranscriptions > 0);
             },
+            onVadLevel: localStorage.getItem('odysseus_voice_debug') === '1'
+              ? ({ rms, threshold, loud, speaking }) => {
+                  const now = Date.now();
+                  if (now - vadDebugLast < 1000) return;
+                  vadDebugLast = now;
+                  console.debug('[voice-vad]', { rms, threshold, loud, speaking });
+                }
+              : undefined,
             onTranscript: enqueueTranscript,
           }
         );
@@ -3871,15 +3971,34 @@ function startOdysseusApp() {
       });
     });
 
+    window.addEventListener('odysseus:tts-start', () => {
+      if (!active) return;
+      ttsBusy = true;
+      clearTtsWatchdog();
+      if (voiceRecorderModule.suppressVad) voiceRecorderModule.suppressVad(TTS_SUPPRESS_WATCHDOG_MS);
+      ttsWatchdog = setTimeout(() => {
+        ttsWatchdog = null;
+        if (!active) return;
+        ttsBusy = false;
+        if (voiceRecorderModule.suppressVad) voiceRecorderModule.suppressVad(0);
+        setTimeout(processTranscriptQueue, 0);
+      }, TTS_SUPPRESS_WATCHDOG_MS);
+    });
+
     window.addEventListener('odysseus:assistant-response-complete', () => {
       if (!active) return;
-      chatBusy = false;
-      setTimeout(processTranscriptQueue, 150);
+      clearChatBusy();
+      if (!ttsBusy) setTimeout(processTranscriptQueue, 150);
     });
 
     window.addEventListener('odysseus:tts-idle', () => {
       if (!active) return;
-      processTranscriptQueue();
+      clearTtsWatchdog();
+      ttsBusy = false;
+      // 600ms cooldown after TTS ends to let room echo settle before re-enabling VAD
+      if (voiceRecorderModule.suppressVad) voiceRecorderModule.suppressVad(600);
+      clearChatBusy();
+      setTimeout(processTranscriptQueue, 700);
     });
   })();
 

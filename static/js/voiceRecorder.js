@@ -179,9 +179,20 @@ export function startRecording(onFileCreated, showToast, showError, options = {}
 
   audioChunks = [];
 
+  // Detect best supported mime type — Safari doesn't support audio/webm
+  const _mimeTypeCandidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/aac',
+  ];
+  const _detectedMime = _mimeTypeCandidates.find(t => MediaRecorder.isTypeSupported(t)) || '';
+
   navigator.mediaDevices.getUserMedia({ audio: true })
     .then(stream => {
-      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      mediaRecorder = _detectedMime
+        ? new MediaRecorder(stream, { mimeType: _detectedMime })
+        : new MediaRecorder(stream);
 
       mediaRecorder.ondataavailable = event => {
         if (event.data.size > 0) {
@@ -192,7 +203,7 @@ export function startRecording(onFileCreated, showToast, showError, options = {}
       mediaRecorder.onstop = async () => {
         stream.getTracks().forEach(track => track.stop());
 
-        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        const audioBlob = new Blob(audioChunks, { type: _detectedMime || 'audio/webm' });
         const provider = _sttProvider;
 
         if (provider === 'browser') {
@@ -336,14 +347,16 @@ export async function startContinuousRecording(showToast, showError, options = {
 
   if (continuousState?.active) return true;
 
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  // Create AudioContext synchronously before any await — Safari suspends it
+  // if created after an await, causing the analyser to always read silence.
   const AudioContext = window.AudioContext || window.webkitAudioContext;
   const audioContext = AudioContext ? new AudioContext() : null;
   if (!audioContext) {
-    _stopTracks(stream);
     if (showError) showError('Audio analysis is not supported in this browser.');
     return false;
   }
+
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
   }
@@ -361,6 +374,7 @@ export async function startContinuousRecording(showToast, showError, options = {
   const mimeType = mimeTypeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
   const vadData = new Uint8Array(analyser.fftSize);
   const useChunkedTranscription = options.chunkedTranscription === true;
+  const tickMs = options.tickMs || 500;
 
   continuousState = {
     active: true,
@@ -382,9 +396,16 @@ export async function startContinuousRecording(showToast, showError, options = {
     maxPreludeChunks: options.preludeChunks || 4,
     segmentMs: 0,
     segmentTimer: null,
+    tickMs,
+    lastTickAt: Date.now(),
+    tickRestarting: false,
     finalizeTimer: null,
     vadTimer: null,
     transcribeCount: 0,
+    // Dedicated single-recorder for the current utterance — avoids concatenating
+    // blobs from multiple MediaRecorder instances which produces invalid audio.
+    utteranceRecorder: null,
+    utteranceRecorderChunks: [],
     options,
     showToast,
     showError,
@@ -401,7 +422,7 @@ export async function startContinuousRecording(showToast, showError, options = {
     // starts/ends based on real silence, not a fixed clock — so a whole
     // sentence accumulates before anything is sent, instead of each ~3.5s
     // window being treated as a complete thought.
-    _startTickCapture(options.tickMs || 500);
+    _startTickCapture(tickMs);
     _startContinuousVad(maxUtteranceMs);
   }
   if (showToast) showToast('Voice mode listening...');
@@ -415,6 +436,8 @@ function _startTickCapture(tickMs) {
   const chunks = [];
   const recorder = st.mimeType ? new MediaRecorder(st.stream, { mimeType: st.mimeType }) : new MediaRecorder(st.stream);
   st.recorder = recorder;
+  st.tickMs = tickMs;
+  st.lastTickAt = Date.now();
 
   recorder.ondataavailable = (event) => {
     if (event.data.size > 0) chunks.push(event.data);
@@ -426,6 +449,9 @@ function _startTickCapture(tickMs) {
   };
   recorder.onstop = () => {
     if (continuousState !== st || !st.active) return;
+    const shouldRestart = st.recorder === recorder;
+    st.lastTickAt = Date.now();
+    st.tickRestarting = false;
     let chunkSize = 0;
     chunks.forEach((blob) => {
       chunkSize += blob.size;
@@ -435,7 +461,7 @@ function _startTickCapture(tickMs) {
       if (st.speechStarted) st.utteranceChunks.push(item);
     });
     if (chunkSize && st.options.onAudioChunk) st.options.onAudioChunk(chunkSize);
-    _startTickCapture(tickMs);
+    if (shouldRestart) _startTickCapture(tickMs);
   };
 
   recorder.start();
@@ -444,6 +470,26 @@ function _startTickCapture(tickMs) {
       try { recorder.stop(); } catch (e) { /* ignore */ }
     }
   }, tickMs);
+}
+
+function _restartTickCapture(st) {
+  if (!st?.active || st.tickRestarting) return;
+  st.tickRestarting = true;
+  if (st.segmentTimer) {
+    clearTimeout(st.segmentTimer);
+    st.segmentTimer = null;
+  }
+  const oldRecorder = st.recorder;
+  if (oldRecorder && oldRecorder.state === 'recording') {
+    try { oldRecorder.stop(); } catch (e) { /* ignore */ }
+  }
+  setTimeout(() => {
+    if (continuousState !== st || !st.active) return;
+    if (st.recorder === oldRecorder || !st.recorder || st.recorder.state === 'inactive') {
+      _startTickCapture(st.tickMs || 500);
+    }
+    st.tickRestarting = false;
+  }, 250);
 }
 
 // Records one fixed-length segment with a dedicated MediaRecorder, then (if
@@ -530,11 +576,24 @@ function _startContinuousVad(maxUtteranceMs) {
   const manualThreshold = Number(st.options.silenceThreshold || 0);
   const minThreshold = Number(st.options.minSilenceThreshold || 0.010);
   const thresholdMultiplier = Number(st.options.thresholdMultiplier || 3.25);
+  const maxThreshold = Number(st.options.maxSilenceThreshold || 0.055);
+  const thresholdCeiling = Math.max(minThreshold, maxThreshold);
 
   let loudSince = null;
   st.vadTimer = setInterval(() => {
     const current = continuousState;
     if (!current?.active) return;
+
+    // Skip VAD when TTS is playing or in cooldown — prevents mic from picking
+    // up speaker output and falsely triggering a new recording.
+    if (current.suppressUntil && Date.now() < current.suppressUntil) {
+      loudSince = null;
+      return;
+    }
+
+    if (current.lastTickAt && Date.now() - current.lastTickAt > 2500) {
+      _restartTickCapture(current);
+    }
 
     current.analyser.getByteTimeDomainData(current.vadData);
     let sum = 0;
@@ -550,10 +609,10 @@ function _startContinuousVad(maxUtteranceMs) {
       current.noiseSamples += 1;
     }
 
-    const adaptiveThreshold = Math.max(
-      minThreshold,
-      current.noiseFloor == null ? minThreshold : current.noiseFloor * thresholdMultiplier
-    );
+    const adaptiveBase = current.noiseFloor == null
+      ? minThreshold
+      : current.noiseFloor * thresholdMultiplier;
+    const adaptiveThreshold = Math.min(thresholdCeiling, Math.max(minThreshold, adaptiveBase));
     const threshold = manualThreshold > 0 ? manualThreshold : adaptiveThreshold;
     const loud = rms > threshold;
     if (current.options.onVadLevel) current.options.onVadLevel({ rms, threshold, loud, speaking: current.speechStarted });
@@ -569,9 +628,33 @@ function _startContinuousVad(maxUtteranceMs) {
         current.speechStarted = true;
         current.isSpeaking = true;
         current.utteranceStartedAt = now;
-        const seen = new Set(current.utteranceChunks.map(chunk => chunk.seq));
-        const prelude = current.rollingChunks.filter(chunk => !seen.has(chunk.seq));
-        current.utteranceChunks = prelude.concat(current.utteranceChunks);
+        // Start a single dedicated recorder for this utterance so we produce one
+        // valid, self-contained audio file instead of concatenating blobs from
+        // multiple per-tick MediaRecorder instances (which produces invalid audio).
+        current.utteranceChunks = [];
+        current.utteranceRecorderChunks = [];
+        if (current.utteranceRecorder && current.utteranceRecorder.state !== 'inactive') {
+          try { current.utteranceRecorder.stop(); } catch (_e) {}
+        }
+        try {
+          const uRec = current.mimeType
+            ? new MediaRecorder(current.stream, { mimeType: current.mimeType })
+            : new MediaRecorder(current.stream);
+          current.utteranceRecorder = uRec;
+          uRec.ondataavailable = (ev) => {
+            // Don't guard against current.utteranceRecorder === uRec here —
+            // _finalizeContinuousUtterance nulls utteranceRecorder before calling
+            // uRec.stop(), so ondataavailable would see null === uRec → false and
+            // silently drop the audio data. Safe to push unconditionally because
+            // utteranceRecorderChunks is cleared at every new utterance start.
+            if (ev.data.size > 0) current.utteranceRecorderChunks.push(ev.data);
+          };
+          uRec.onerror = () => {};
+          uRec.start();
+        } catch (e) {
+          console.warn('Utterance recorder start failed:', e);
+          current.utteranceRecorder = null;
+        }
         if (current.options.onSpeechStart) current.options.onSpeechStart();
       }
       return;
@@ -597,35 +680,48 @@ function _finalizeContinuousUtterance() {
   const st = continuousState;
   if (!st?.active || !st.speechStarted) return;
 
-  const chunks = st.utteranceChunks.map(item => item.blob);
   st.speechStarted = false;
   st.isSpeaking = false;
   st.quietSince = null;
   st.utteranceStartedAt = null;
   st.utteranceChunks = [];
-  st.rollingChunks = [];
 
   if (st.options.onSpeechEnd) st.options.onSpeechEnd();
-  if (!chunks.length) return;
 
-  const audioBlob = new Blob(chunks, { type: st.mimeType || 'audio/webm' });
-  st.transcribeCount += 1;
-  if (st.options.onTranscriptionStart) st.options.onTranscriptionStart(st.transcribeCount);
+  // Grab and clear the dedicated utterance recorder
+  const uRec = st.utteranceRecorder;
+  st.utteranceRecorder = null;
 
-  transcribeOnServer(audioBlob)
-    .then((text) => {
-      if (!continuousState?.active) return;
-      const trimmed = (text || '').trim();
-      if (trimmed && st.options.onTranscript) st.options.onTranscript(trimmed);
-      else if (st.showToast) st.showToast('No speech detected');
-    })
-    .catch((e) => {
-      console.error('Continuous STT transcription error:', e);
-      if (st.showError) st.showError('Transcription failed: ' + e.message);
-    })
-    .finally(() => {
-      if (continuousState?.active && st.options.onTranscriptionEnd) st.options.onTranscriptionEnd();
-    });
+  if (!uRec) return;
+
+  const _sendChunks = () => {
+    const chunks = st.utteranceRecorderChunks.splice(0);
+    if (!chunks.length) return;
+    const audioBlob = new Blob(chunks, { type: st.mimeType || 'audio/webm' });
+    st.transcribeCount += 1;
+    if (st.options.onTranscriptionStart) st.options.onTranscriptionStart(st.transcribeCount);
+    transcribeOnServer(audioBlob)
+      .then((text) => {
+        if (!continuousState?.active) return;
+        const trimmed = (text || '').trim();
+        if (trimmed && st.options.onTranscript) st.options.onTranscript(trimmed);
+        else if (st.showToast) st.showToast('No speech detected');
+      })
+      .catch((e) => {
+        console.error('Continuous STT transcription error:', e);
+        if (st.showError) st.showError('Transcription failed: ' + e.message);
+      })
+      .finally(() => {
+        if (continuousState?.active && st.options.onTranscriptionEnd) st.options.onTranscriptionEnd();
+      });
+  };
+
+  if (uRec.state === 'recording') {
+    uRec.onstop = _sendChunks;
+    try { uRec.stop(); } catch (e) { _sendChunks(); }
+  } else {
+    _sendChunks();
+  }
 }
 
 export function stopContinuousRecording() {
@@ -635,14 +731,15 @@ export function stopContinuousRecording() {
   if (st.vadTimer) clearInterval(st.vadTimer);
   if (st.segmentTimer) clearTimeout(st.segmentTimer);
   if (st.finalizeTimer) clearTimeout(st.finalizeTimer);
-  // Flush whatever the current segment/utterance recorder has buffered so
-  // far — stop() fires its onstop handler asynchronously, which still runs
-  // (and transcribes) after continuousState is nulled below.
+  // Flush the tick recorder
   if (st.recorder && st.recorder.state !== 'inactive') {
     try { st.recorder.stop(); } catch (e) { /* ignore */ }
   }
+  // Finalize any in-progress utterance (stops the dedicated utterance recorder)
   if (st.speechStarted) {
     try { _finalizeContinuousUtterance(); } catch (e) { console.warn('Failed to finalize utterance:', e); }
+  } else if (st.utteranceRecorder && st.utteranceRecorder.state !== 'inactive') {
+    try { st.utteranceRecorder.stop(); } catch (e) { /* ignore */ }
   }
   _stopTracks(st.stream);
   if (st.audioContext) st.audioContext.close().catch(() => {});
@@ -651,6 +748,12 @@ export function stopContinuousRecording() {
 
 export function getIsContinuousRecording() {
   return !!continuousState?.active;
+}
+
+export function suppressVad(ms) {
+  if (continuousState) {
+    continuousState.suppressUntil = Date.now() + (ms || 0);
+  }
 }
 
 /**
@@ -674,6 +777,7 @@ const voiceRecorderModule = {
   startContinuousRecording,
   stopContinuousRecording,
   getIsContinuousRecording,
+  suppressVad,
   getIsRecording,
   init,
   refreshSttProvider,

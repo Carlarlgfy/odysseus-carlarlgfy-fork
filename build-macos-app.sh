@@ -65,6 +65,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
     <key>NSHighResolutionCapable</key> <true/>
     <key>LSUIElement</key>             <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>$APP_NAME needs microphone access for voice input.</string>
 </dict>
 </plist>
 PLIST
@@ -72,7 +74,7 @@ PLIST
 # ── Launcher executable (placeholders filled below) ──
 cat > "$APP/Contents/MacOS/$APP_NAME.tmpl" <<'LAUNCHER'
 #!/bin/bash
-# Odysseus.app — start the local server and open the UI in an app window.
+# __APP_NAME__.app — start the local server and open the UI in an app window.
 INSTALL_DIR="__INSTALL_DIR__"
 PORT="__PORT__"
 APP_DATA_DIR="__APP_DATA_DIR__"
@@ -83,21 +85,28 @@ if [ -n "$APP_DATA_DIR" ]; then
 fi
 
 UVICORN="$INSTALL_DIR/venv/bin/uvicorn"
-LOG="$INSTALL_DIR/logs/odysseus-app.log"
-PID_FILE="$INSTALL_DIR/logs/odysseus-app.pid"
+# Use ~/Library paths — always writable by the GUI process, no TCC/Documents restrictions.
+LOG_DIR="$HOME/Library/Logs/__APP_NAME__"
+RUN_DIR="$HOME/Library/Application Support/__APP_NAME__/run"
+LOG="$LOG_DIR/odysseus-app.log"
+PID_FILE="$RUN_DIR/odysseus-app.pid"
 
-notify() { /usr/bin/osascript -e "display notification \"$1\" with title \"Odysseus\"" >/dev/null 2>&1; }
+notify() { /usr/bin/osascript -e "display notification \"$1\" with title \"__APP_NAME__\"" >/dev/null 2>&1; }
+
 die_gui() {
-  /usr/bin/osascript -e "display dialog \"$1\" with title \"Odysseus\" buttons {\"OK\"} default button 1 with icon stop" >/dev/null 2>&1
+  local msg_file
+  msg_file="$(mktemp /tmp/odysseus-err.XXXXXX 2>/dev/null)" || msg_file="/tmp/odysseus-err-$$.txt"
+  printf '%s' "$1" > "$msg_file" 2>/dev/null
+  /usr/bin/osascript - "$msg_file" >/dev/null 2>&1 <<'OSA'
+on run argv
+  set f to item 1 of argv
+  set msg to do shell script "cat " & quoted form of f & " 2>/dev/null || echo '(no details)'"
+  display dialog msg with title "__APP_NAME__" buttons {"OK"} default button 1 with icon stop
+end run
+OSA
+  rm -f "$msg_file" 2>/dev/null
   exit 1
 }
-
-[ -x "$UVICORN" ] || die_gui "Odysseus isn't set up yet. Open Terminal and run:
-
-cd $INSTALL_DIR
-python3.11 -m venv venv
-./venv/bin/pip install -r requirements.txt
-./venv/bin/python setup.py"
 
 # Open the UI in its own window. Chromium browsers get app mode; Safari needs
 # AppleScript because `open URL` reuses an existing browser window as a tab.
@@ -127,8 +136,20 @@ OSA
   /usr/bin/open -n "$URL"
 }
 
-mkdir -p "$INSTALL_DIR/logs"
+# Create safe log/run dirs (always writable, no TCC issues).
+mkdir -p "$LOG_DIR" "$RUN_DIR" 2>/dev/null
 [ -n "$APP_DATA_DIR" ] && mkdir -p "$APP_DATA_DIR"
+
+# Preflight checks.
+[ -d "$INSTALL_DIR" ] || die_gui "Install folder not found: $INSTALL_DIR"
+[ -x "$UVICORN" ] || die_gui "uvicorn not found or not executable: $UVICORN
+
+Run setup first:
+cd $INSTALL_DIR
+python3.11 -m venv venv
+./venv/bin/pip install -r requirements.txt"
+[ -w "$LOG_DIR" ] || die_gui "Log directory not writable: $LOG_DIR"
+[ -w "$RUN_DIR" ] || die_gui "Run directory not writable: $RUN_DIR"
 
 # Already running? Just open the UI.
 if /usr/bin/curl -s -o /dev/null --max-time 2 "$URL"; then
@@ -137,27 +158,31 @@ if /usr/bin/curl -s -o /dev/null --max-time 2 "$URL"; then
 fi
 
 notify "Starting…"
-cd "$INSTALL_DIR" || die_gui "Install folder not found: $INSTALL_DIR"
+cd "$INSTALL_DIR" || die_gui "Cannot cd to install folder: $INSTALL_DIR"
+
 if [ "$(uname -m)" = "arm64" ]; then
   nohup arch -arm64 "$UVICORN" app:app --host 127.0.0.1 --port "$PORT" >>"$LOG" 2>&1 &
 else
   nohup "$UVICORN" app:app --host 127.0.0.1 --port "$PORT" >>"$LOG" 2>&1 &
 fi
 SERVER_PID=$!
-echo "$SERVER_PID" > "$PID_FILE"
+printf "%s\n" "$SERVER_PID" > "$PID_FILE" 2>/dev/null || true
 
-# Wait for readiness (first run downloads an embedding model — allow ~2 min).
+# Wait for readiness (first run may download models — allow ~2 min).
 READY=0
 for i in $(seq 1 120); do
   /usr/bin/curl -s -o /dev/null --max-time 2 "$URL" && { READY=1; break; }
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    LAST_LOG="$(tail -n 40 "$LOG" 2>/dev/null)"
+    LAST_LOG="$(tail -n 60 "$LOG" 2>/dev/null)"
     die_gui "Odysseus failed to start.
 
-Log:
-$LOG
+Command:
+$UVICORN app:app --host 127.0.0.1 --port $PORT
 
-$LAST_LOG"
+Log: $LOG
+
+Last log lines:
+${LAST_LOG:-(log empty or unreadable)}"
   fi
   sleep 1
 done
@@ -165,12 +190,15 @@ done
 if [ "$READY" = "1" ]; then
   open_ui
 else
-  notify "Odysseus is taking a while — open $URL once it finishes starting."
+  notify "__APP_NAME__ is taking a while — open $URL once it finishes starting."
 fi
 exit 0
 LAUNCHER
 
-sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" -e "s|__PORT__|$PORT|g" -e "s|__APP_DATA_DIR__|$APP_DATA_DIR|g" \
+sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    -e "s|__PORT__|$PORT|g" \
+    -e "s|__APP_DATA_DIR__|$APP_DATA_DIR|g" \
+    -e "s|__APP_NAME__|$APP_NAME|g" \
     "$APP/Contents/MacOS/$APP_NAME.tmpl" > "$APP/Contents/MacOS/$APP_NAME"
 rm -f "$APP/Contents/MacOS/$APP_NAME.tmpl"
 chmod +x "$APP/Contents/MacOS/$APP_NAME"

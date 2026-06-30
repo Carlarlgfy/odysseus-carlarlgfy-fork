@@ -24,6 +24,10 @@ class AITTSManager {
         this._streamResetFn = null;
         this._streamDebounceTimer = null;
 
+        // Volume control (0.0 – 1.0); persisted across sessions
+        this.volume = parseFloat(localStorage.getItem('odysseus_tts_volume') ?? '1');
+        this.muted = localStorage.getItem('odysseus_tts_muted') === 'true';
+
         // Check if TTS service is available
         this.checkAvailability();
     }
@@ -186,6 +190,7 @@ class AITTSManager {
             const audioUrl = await this.synthesize(text);
 
             this.currentAudio = new Audio(audioUrl);
+            this.currentAudio.volume = this.muted ? 0 : this.volume;
             await this.currentAudio.play();
             this.isPlaying = true;
             // Note: onended should be set by the caller (addAITTSButton)
@@ -313,28 +318,53 @@ class AITTSManager {
 
                 await new Promise((resolve, reject) => {
                     const audio = new Audio(audioUrl);
-                    if (this._provider === 'local' && this.playbackSpeed !== 1) {
-                        audio.playbackRate = this.playbackSpeed;
-                    }
-                    this.currentAudio = audio;
-                    audio.onended = () => {
+                    let settled = false;
+                    let timeout = null;
+                    const finish = () => {
+                        if (settled) return;
+                        settled = true;
+                        if (timeout) clearTimeout(timeout);
                         this.isPlaying = false;
                         if (this.currentAudio === audio) this.currentAudio = null;
                         resolve();
                     };
-                    audio.onerror = (e) => {
+                    const fail = (err) => {
+                        if (settled) return;
+                        settled = true;
+                        if (timeout) clearTimeout(timeout);
                         this.isPlaying = false;
                         if (this.currentAudio === audio) this.currentAudio = null;
-                        reject(new Error('Audio playback error'));
+                        reject(err);
                     };
+
+                    timeout = setTimeout(() => {
+                        console.warn('TTS playback timed out; continuing queue');
+                        try { audio.pause(); } catch (_) {}
+                        finish();
+                    }, 30000);
+
+                    if (this._provider === 'local' && this.playbackSpeed !== 1) {
+                        audio.playbackRate = this.playbackSpeed;
+                    }
+                    audio.volume = this.muted ? 0 : this.volume;
+                    this.currentAudio = audio;
+                    audio.onended = finish;
+                    audio.onerror = () => fail(new Error('Audio playback error'));
                     audio.onpause = () => {
-                        if (this.currentAudio !== audio) {
-                            resolve();
-                        }
+                        if (this.currentAudio !== audio) finish();
                     };
-                    audio.play().then(() => {
-                        this.isPlaying = true;
-                    }).catch(reject);
+                    let playPromise = null;
+                    try {
+                        playPromise = audio.play();
+                    } catch (err) {
+                        fail(err);
+                        return;
+                    }
+                    if (playPromise && typeof playPromise.then === 'function') {
+                        playPromise.then(() => {
+                            if (!settled) this.isPlaying = true;
+                        }).catch(fail);
+                    }
                 });
             }
         } finally {
@@ -452,6 +482,24 @@ class AITTSManager {
             URL.revokeObjectURL(url);
         }
         this.cache.clear();
+    }
+
+    setVolume(v) {
+        this.volume = Math.max(0, Math.min(1, v));
+        this.muted = false;
+        localStorage.setItem('odysseus_tts_volume', String(this.volume));
+        localStorage.setItem('odysseus_tts_muted', 'false');
+        if (this.currentAudio) this.currentAudio.volume = this.volume;
+    }
+
+    toggleMute() {
+        this.muted = !this.muted;
+        localStorage.setItem('odysseus_tts_muted', String(this.muted));
+        if (this.currentAudio) this.currentAudio.volume = this.muted ? 0 : this.volume;
+    }
+
+    adjustVolume(delta) {
+        this.setVolume(this.volume + delta);
     }
 }
 
