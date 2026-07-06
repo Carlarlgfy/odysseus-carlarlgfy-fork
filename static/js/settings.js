@@ -1091,6 +1091,58 @@ function _ensurePiperVoiceModal() {
         <button class="close-btn" id="close-piper-voice-modal" aria-label="Close voice library">✖</button>
       </div>
       <div class="modal-body piper-voice-modal-body">
+        <div id="voice-lib-status" class="admin-toggle-sub"></div>
+
+        <h3 style="margin:6px 0 4px">Speech engines</h3>
+        <div id="voice-lib-providers"></div>
+
+        <h3 style="margin:14px 0 4px">My voices</h3>
+        <div class="admin-toggle-sub" style="margin-bottom:6px">
+          The default voice is used when the assistant speaks in voice mode.
+        </div>
+        <div id="voice-lib-profiles"></div>
+        <div style="margin:6px 0 2px">
+          <button type="button" class="admin-btn-sm" id="voice-lib-add-toggle">+ Add custom voice</button>
+        </div>
+        <div id="voice-lib-add-form" style="display:none;margin:8px 0;padding:10px;border:1px solid var(--border,#333);border-radius:8px">
+          <div style="display:grid;grid-template-columns:110px 1fr;gap:6px;align-items:center">
+            <label class="settings-label">Name</label><input id="vl-add-name" class="settings-input" placeholder="My voice">
+            <label class="settings-label">Engine</label>
+            <select id="vl-add-provider" class="settings-select">
+              <option value="kokoro">Kokoro-82M (fast, natural)</option>
+              <option value="piper">Piper (lightweight)</option>
+              <option value="dots_tts_mlx">dots.tts (experimental cloning)</option>
+            </select>
+            <label class="settings-label">Voice id</label><input id="vl-add-voice" class="settings-input" placeholder="af_heart / speaker id">
+            <label class="settings-label">Model path</label><input id="vl-add-model" class="settings-input" placeholder="HF repo or /path/to/model (.onnx for Piper)">
+            <label class="settings-label">Speed</label><input id="vl-add-speed" class="settings-input" value="1.0">
+            <label class="settings-label">Sample text</label><input id="vl-add-sample" class="settings-input" placeholder="Hello! This is a preview of my voice.">
+          </div>
+          <div id="vl-add-dots" style="display:none;margin-top:6px">
+            <div class="admin-toggle-sub" style="margin:4px 0">
+              Custom/cloned voices require reference audio you own or have permission to use.
+            </div>
+            <div style="display:grid;grid-template-columns:110px 1fr;gap:6px;align-items:center">
+              <label class="settings-label">Ref audio</label><input id="vl-add-refaudio" class="settings-input" placeholder="/path/to/consented-reference.wav">
+              <label class="settings-label">Ref transcript</label><input id="vl-add-reftext" class="settings-input" placeholder="Exact words spoken in the reference audio">
+              <label class="settings-label">Consent note</label><input id="vl-add-consent" class="settings-input" placeholder="e.g. My own voice, recorded 2026-07-01">
+              <label class="settings-label">Source</label><input id="vl-add-source" class="settings-input" placeholder="Where the reference audio came from">
+            </div>
+          </div>
+          <div style="margin-top:8px;display:flex;gap:6px">
+            <button type="button" class="admin-btn-sm" id="vl-add-save">Save voice</button>
+            <button type="button" class="admin-btn-sm" id="vl-add-cancel">Cancel</button>
+          </div>
+        </div>
+
+        <h3 style="margin:14px 0 4px">Conversation</h3>
+        <label style="display:flex;align-items:center;gap:8px;margin:4px 0">
+          <input type="checkbox" id="voice-lib-bargein">
+          <span>Interrupt by speaking (barge-in) — talking over the assistant stops playback</span>
+        </label>
+        <div class="admin-toggle-sub">Off = half-duplex: the mic ignores speech while the assistant talks.</div>
+
+        <h3 style="margin:14px 0 4px">Piper voice downloads</h3>
         <div class="admin-toggle-sub" style="margin-bottom:10px">
           Download free Piper voices, preview installed voices, and assign a voice per language.
         </div>
@@ -1103,7 +1155,221 @@ function _ensurePiperVoiceModal() {
   piperVoiceModal.addEventListener('click', (e) => {
     if (e.target === piperVoiceModal) closeVoiceLibrary();
   });
+
+  // Barge-in toggle (client-side preference; read by the voice loop on start)
+  const bargeIn = piperVoiceModal.querySelector('#voice-lib-bargein');
+  bargeIn.checked = localStorage.getItem('odysseus_voice_barge_in') === '1';
+  bargeIn.addEventListener('change', () => {
+    localStorage.setItem('odysseus_voice_barge_in', bargeIn.checked ? '1' : '0');
+  });
+
+  // Add-voice form wiring
+  const addToggle = piperVoiceModal.querySelector('#voice-lib-add-toggle');
+  const addForm = piperVoiceModal.querySelector('#voice-lib-add-form');
+  const addProvider = piperVoiceModal.querySelector('#vl-add-provider');
+  const dotsFields = piperVoiceModal.querySelector('#vl-add-dots');
+  addToggle.addEventListener('click', () => {
+    addForm.style.display = addForm.style.display === 'none' ? '' : 'none';
+  });
+  addProvider.addEventListener('change', () => {
+    dotsFields.style.display = addProvider.value === 'dots_tts_mlx' ? '' : 'none';
+  });
+  piperVoiceModal.querySelector('#vl-add-cancel').addEventListener('click', () => {
+    addForm.style.display = 'none';
+  });
+  piperVoiceModal.querySelector('#vl-add-save').addEventListener('click', async () => {
+    const val = (id) => (piperVoiceModal.querySelector('#' + id).value || '').trim();
+    try {
+      _setVoiceLibStatus('Saving voice...');
+      const res = await fetch('/api/tts/voices', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: val('vl-add-name'),
+          provider: addProvider.value,
+          voice: val('vl-add-voice'),
+          model_path: val('vl-add-model'),
+          speed: parseFloat(val('vl-add-speed')) || 1.0,
+          sample_text: val('vl-add-sample'),
+          ref_audio: val('vl-add-refaudio'),
+          ref_text: val('vl-add-reftext'),
+          consent_note: val('vl-add-consent'),
+          source: val('vl-add-source'),
+        })
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail?.message || 'Save failed');
+      }
+      addForm.style.display = 'none';
+      _setVoiceLibStatus('Voice saved');
+      await _renderVoiceProfiles();
+    } catch (e) {
+      _setVoiceLibStatus(e.message, true);
+    }
+  });
+
   return piperVoiceModal;
+}
+
+function _setVoiceLibStatus(text, isError) {
+  const status = el('voice-lib-status');
+  if (!status) return;
+  status.textContent = text || '';
+  status.style.color = isError ? 'var(--red, #e55)' : '';
+}
+
+function _providerBadge(row) {
+  const color = row.available ? 'var(--green, #4a4)' : (row.installed ? 'var(--yellow, #ca3)' : 'var(--fg-dim, #888)');
+  const label = row.available ? 'Ready' : (row.installed ? 'Needs setup' : 'Not installed');
+  return `<span style="border:1px solid ${color};color:${color};border-radius:10px;padding:1px 8px;font-size:11px">${label}</span>`;
+}
+
+async function _renderVoiceProviders() {
+  const box = el('voice-lib-providers');
+  if (!box) return;
+  box.innerHTML = '<div class="admin-toggle-sub">Loading engines...</div>';
+  try {
+    const res = await fetch('/api/tts/providers', { credentials: 'same-origin' });
+    if (!res.ok) throw new Error('Failed to load providers');
+    const data = await res.json();
+    box.innerHTML = (data.providers || []).map((p) => `
+      <div class="piper-voice-card" data-provider-id="${esc(p.id)}" style="margin-bottom:6px">
+        <div class="piper-voice-card-head">
+          <div>
+            <div class="piper-voice-name">${esc(p.label)}${p.active ? ' <span style="opacity:.7;font-size:11px">— active</span>' : ''}${p.experimental ? ' <span style="color:var(--yellow,#ca3);font-size:11px">experimental</span>' : ''}</div>
+            <div class="piper-voice-meta">${esc(p.tier)}${p.backend && p.installed ? ' · ' + esc(p.backend) : ''}</div>
+          </div>
+          ${_providerBadge(p)}
+        </div>
+        ${p.hint ? `<div class="piper-voice-sample">${esc(p.hint)}</div>` : ''}
+        ${p.id === 'kokoro' && p.installed ? `
+          <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">
+            ${(p.voices || []).map(v => `
+              <button type="button" class="admin-btn-sm kokoro-voice-chip" data-voice="${esc(v.id)}" data-name="${esc(v.name)}"
+                title="${esc(v.accent)} ${esc(v.gender)}">${esc(v.name)}</button>`).join('')}
+          </div>
+          <div class="admin-toggle-sub" style="margin-top:4px">Click a Kokoro voice to save it and make it the default. First use downloads the model (~350 MB).</div>
+        ` : ''}
+      </div>`).join('');
+
+    box.querySelectorAll('.kokoro-voice-chip').forEach((chip) => {
+      chip.addEventListener('click', async () => {
+        const voiceId = chip.dataset.voice;
+        try {
+          _setVoiceLibStatus('Saving Kokoro voice...');
+          const res2 = await fetch('/api/tts/voices', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: 'kokoro-' + voiceId,
+              name: chip.dataset.name + ' (Kokoro)',
+              provider: 'kokoro',
+              voice: voiceId,
+              set_default: true,
+            })
+          });
+          if (!res2.ok) {
+            const err = await res2.json().catch(() => ({}));
+            throw new Error(err.detail?.message || 'Save failed');
+          }
+          _setVoiceLibStatus(chip.dataset.name + ' is now the default voice');
+          if (window.aiTTSManager) window.aiTTSManager.checkAvailability();
+          await Promise.all([_renderVoiceProfiles(), _renderVoiceProviders()]);
+        } catch (e) {
+          _setVoiceLibStatus(e.message, true);
+        }
+      });
+    });
+  } catch (e) {
+    box.innerHTML = '';
+    _setVoiceLibStatus(e.message, true);
+  }
+}
+
+async function _renderVoiceProfiles() {
+  const box = el('voice-lib-profiles');
+  if (!box) return;
+  box.innerHTML = '<div class="admin-toggle-sub">Loading voices...</div>';
+  try {
+    const res = await fetch('/api/tts/voices', { credentials: 'same-origin' });
+    if (!res.ok) throw new Error('Failed to load voices');
+    const data = await res.json();
+    const voices = data.voices || [];
+    if (!voices.length) {
+      box.innerHTML = '<div class="admin-toggle-sub">No saved voices yet — pick a Kokoro voice above, assign a Piper voice below, or add a custom one.</div>';
+      return;
+    }
+    box.innerHTML = voices.map((v) => `
+      <div class="piper-voice-card" data-profile-id="${esc(v.id)}" style="margin-bottom:6px">
+        <div class="piper-voice-card-head">
+          <div>
+            <div class="piper-voice-name">${esc(v.name)}${v.is_default ? ' <span style="color:var(--green,#4a4);font-size:11px">★ default</span>' : ''}</div>
+            <div class="piper-voice-meta">${esc(v.provider)}${v.voice ? ' · ' + esc(v.voice) : ''} · ${esc(String(v.speed || 1))}x${v.consent_note ? ' · consent: ' + esc(v.consent_note) : ''}</div>
+          </div>
+        </div>
+        <div class="piper-voice-actions">
+          <button type="button" class="admin-btn-sm vl-preview-btn">Preview</button>
+          <button type="button" class="admin-btn-sm vl-default-btn" ${v.is_default ? 'disabled' : ''}>${v.is_default ? 'Default' : 'Set default'}</button>
+          <button type="button" class="admin-btn-sm vl-delete-btn">Delete</button>
+        </div>
+      </div>`).join('');
+
+    box.querySelectorAll('.piper-voice-card').forEach((card) => {
+      const profileId = card.dataset.profileId;
+      card.querySelector('.vl-preview-btn')?.addEventListener('click', async () => {
+        _setVoiceLibStatus('Synthesizing preview (first run may download the model)...');
+        try {
+          const res2 = await fetch('/api/tts/voices/preview', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile_id: profileId })
+          });
+          if (!res2.ok) {
+            const err = await res2.json().catch(() => ({}));
+            throw new Error(err.detail?.message || 'Preview failed');
+          }
+          const blob = await res2.blob();
+          if (piperPreviewAudio) piperPreviewAudio.pause();
+          piperPreviewAudio = new Audio(URL.createObjectURL(blob));
+          await piperPreviewAudio.play();
+          _setVoiceLibStatus('');
+        } catch (e) {
+          _setVoiceLibStatus(e.message, true);
+        }
+      });
+      card.querySelector('.vl-default-btn')?.addEventListener('click', async () => {
+        try {
+          const res2 = await fetch('/api/tts/voices/default', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile_id: profileId })
+          });
+          if (!res2.ok) throw new Error('Failed to set default');
+          if (window.aiTTSManager) window.aiTTSManager.checkAvailability();
+          _setVoiceLibStatus('Default voice updated');
+          await Promise.all([_renderVoiceProfiles(), _renderVoiceProviders()]);
+        } catch (e) {
+          _setVoiceLibStatus(e.message, true);
+        }
+      });
+      card.querySelector('.vl-delete-btn')?.addEventListener('click', async () => {
+        try {
+          const res2 = await fetch('/api/tts/voices/' + encodeURIComponent(profileId), {
+            method: 'DELETE', credentials: 'same-origin'
+          });
+          if (!res2.ok) throw new Error('Failed to delete voice');
+          if (window.aiTTSManager) window.aiTTSManager.checkAvailability();
+          await _renderVoiceProfiles();
+        } catch (e) {
+          _setVoiceLibStatus(e.message, true);
+        }
+      });
+    });
+  } catch (e) {
+    box.innerHTML = '';
+    _setVoiceLibStatus(e.message, true);
+  }
 }
 
 function closeVoiceLibrary() {
@@ -1228,6 +1494,8 @@ async function _renderPiperVoiceLibrary() {
 
 export function openVoiceLibrary() {
   _ensurePiperVoiceModal().classList.remove('hidden');
+  _renderVoiceProviders();
+  _renderVoiceProfiles();
   _renderPiperVoiceLibrary();
 }
 

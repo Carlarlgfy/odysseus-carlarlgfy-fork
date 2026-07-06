@@ -47,6 +47,14 @@ DEFAULT_SETTINGS = {
     "tts_piper_voice_by_language": {},
     "tts_piper_default_language": "en",
     "tts_piper_voices_dir": "",
+    # Default voice profile id (see data/tts-voices.json). When set, the
+    # profile's provider/voice/speed override tts_provider/tts_voice/tts_speed.
+    "tts_voice_profile": "",
+    # Hugging Face repo id (or local path) for the Kokoro MLX model.
+    "tts_kokoro_model": "prince-canuma/Kokoro-82M",
+    # Hugging Face repo id (or local path) for the experimental dots.tts MLX
+    # model (e.g. an mf-int4 quant). Empty = not configured.
+    "tts_dots_model": "",
     "stt_enabled": False,
     "stt_provider": "disabled",
     "stt_model": "base",

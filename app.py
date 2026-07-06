@@ -130,6 +130,7 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     "/api/upload",          # large files
     "/api/image",           # diffusion proxies (inpaint/harmonize/upscale/etc.) — own 120s httpx timeout
     "/api/stt",             # Whisper inference is blocking/CPU-bound — exempt from hard timeout
+    "/api/tts",             # first synthesis may load Kokoro/dots models (long download)
 )
 
 

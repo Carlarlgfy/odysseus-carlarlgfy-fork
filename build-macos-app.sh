@@ -67,6 +67,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSUIElement</key>             <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>$APP_NAME needs microphone access for voice input.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>$APP_NAME needs access to the Odysseus install folder in Documents to run its local Python server.</string>
 </dict>
 </plist>
 PLIST
@@ -85,6 +87,7 @@ if [ -n "$APP_DATA_DIR" ]; then
 fi
 
 UVICORN="$INSTALL_DIR/venv/bin/uvicorn"
+VENV_CFG="$INSTALL_DIR/venv/pyvenv.cfg"
 # Use ~/Library paths — always writable by the GUI process, no TCC/Documents restrictions.
 LOG_DIR="$HOME/Library/Logs/__APP_NAME__"
 RUN_DIR="$HOME/Library/Application Support/__APP_NAME__/run"
@@ -148,6 +151,18 @@ Run setup first:
 cd $INSTALL_DIR
 python3.11 -m venv venv
 ./venv/bin/pip install -r requirements.txt"
+if ! /bin/cat "$VENV_CFG" >/dev/null 2>&1; then
+  die_gui "__APP_NAME__ cannot read its Python virtualenv:
+$VENV_CFG
+
+macOS is likely blocking this launcher from reading files in Documents.
+
+Fix:
+System Settings > Privacy & Security > Full Disk Access
+Add this app, then try again.
+
+More permanent fix: move the repo out of Documents, then rebuild the app."
+fi
 [ -w "$LOG_DIR" ] || die_gui "Log directory not writable: $LOG_DIR"
 [ -w "$RUN_DIR" ] || die_gui "Run directory not writable: $RUN_DIR"
 
@@ -174,6 +189,18 @@ for i in $(seq 1 120); do
   /usr/bin/curl -s -o /dev/null --max-time 2 "$URL" && { READY=1; break; }
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     LAST_LOG="$(tail -n 60 "$LOG" 2>/dev/null)"
+    if printf "%s" "$LAST_LOG" | /usr/bin/grep -Eq 'Operation not permitted.*pyvenv\.cfg|pyvenv\.cfg.*Operation not permitted'; then
+      die_gui "__APP_NAME__ was blocked by macOS while reading its Python virtualenv:
+$VENV_CFG
+
+Fix:
+System Settings > Privacy & Security > Full Disk Access
+Add this app, then try again.
+
+More permanent fix: move the repo out of Documents, then rebuild the app.
+
+Log: $LOG"
+    fi
     die_gui "Odysseus failed to start.
 
 Command:

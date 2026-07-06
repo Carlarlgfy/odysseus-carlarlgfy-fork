@@ -26,6 +26,42 @@ let _browserTranscript = '';
 // Cached STT provider — refreshed on settings change
 let _sttProvider = 'disabled';
 
+// Preferred mic constraints: echo cancellation strips speaker/TTS audio out of
+// the mic signal (critical for half-duplex voice chat); noise suppression and
+// AGC help VAD reliability in noisy rooms. Plain booleans are "ideal" hints —
+// browsers ignore unsupported ones instead of erroring, so we verify what we
+// actually got via track.getSettings() after acquiring the stream.
+const MIC_AUDIO_CONSTRAINTS = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
+
+// Actual settings of the most recently acquired mic track
+let _micSettings = null;
+
+async function _getMicStream() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: MIC_AUDIO_CONSTRAINTS });
+  } catch (e) {
+    // Some browsers reject constraint objects outright — retry with the plain form
+    if (e && (e.name === 'OverconstrainedError' || e.name === 'TypeError')) {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } else {
+      throw e;
+    }
+  }
+  const track = stream.getAudioTracks && stream.getAudioTracks()[0];
+  _micSettings = (track && typeof track.getSettings === 'function') ? track.getSettings() : {};
+  console.info('[voice] mic settings:', _micSettings);
+  return stream;
+}
+
+export function getMicSettings() {
+  return _micSettings;
+}
+
 /**
  * Fetch current STT provider from server settings
  */
@@ -188,7 +224,7 @@ export function startRecording(onFileCreated, showToast, showError, options = {}
   ];
   const _detectedMime = _mimeTypeCandidates.find(t => MediaRecorder.isTypeSupported(t)) || '';
 
-  navigator.mediaDevices.getUserMedia({ audio: true })
+  _getMicStream()
     .then(stream => {
       mediaRecorder = _detectedMime
         ? new MediaRecorder(stream, { mimeType: _detectedMime })
@@ -356,7 +392,7 @@ export async function startContinuousRecording(showToast, showError, options = {
     return false;
   }
 
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const stream = await _getMicStream();
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
   }
@@ -588,8 +624,34 @@ function _startContinuousVad(maxUtteranceMs) {
     // up speaker output and falsely triggering a new recording.
     if (current.suppressUntil && Date.now() < current.suppressUntil) {
       loudSince = null;
+      // Optional barge-in: while suppressed, keep watching the mic for
+      // sustained human speech (echo cancellation should have already removed
+      // most speaker leakage). When it persists past bargeInMs, hand control
+      // to the caller — it stops TTS, and normal VAD resumes to capture the
+      // interrupting utterance.
+      if (current.options.bargeIn && current.options.onBargeIn) {
+        current.analyser.getByteTimeDomainData(current.vadData);
+        let bargeSum = 0;
+        for (let i = 0; i < current.vadData.length; i++) {
+          const v = (current.vadData[i] - 128) / 128;
+          bargeSum += v * v;
+        }
+        const bargeRms = Math.sqrt(bargeSum / current.vadData.length);
+        const bargeThreshold = Number(current.options.bargeInThreshold || 0.06);
+        if (bargeRms > bargeThreshold) {
+          if (!current.bargeLoudSince) current.bargeLoudSince = Date.now();
+          if (Date.now() - current.bargeLoudSince >= Number(current.options.bargeInMs || 450)) {
+            current.bargeLoudSince = null;
+            current.suppressUntil = 0; // resume listening right away
+            try { current.options.onBargeIn(); } catch (_e) { /* ignore */ }
+          }
+        } else {
+          current.bargeLoudSince = null;
+        }
+      }
       return;
     }
+    current.bargeLoudSince = null;
 
     if (current.lastTickAt && Date.now() - current.lastTickAt > 2500) {
       _restartTickCapture(current);
@@ -778,6 +840,7 @@ const voiceRecorderModule = {
   stopContinuousRecording,
   getIsContinuousRecording,
   suppressVad,
+  getMicSettings,
   getIsRecording,
   init,
   refreshSttProvider,

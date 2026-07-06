@@ -1,7 +1,18 @@
 # src/tts_service.py
-"""Multi-provider TTS service — dispatches to Piper, Kokoro, API, or browser."""
+"""Multi-provider TTS service — dispatches to Piper, Kokoro, dots.tts, API, or browser.
+
+Provider tiers (see /api/tts/providers):
+  kokoro        — fast natural default for live conversation (Apple Silicon MLX,
+                  falls back to the torch pipeline on CUDA/MPS/CPU)
+  piper         — lightweight always-works fallback (local CPU, .onnx voices)
+  dots_tts_mlx  — experimental high-quality custom-voice / zero-shot cloning
+                  engine on Apple Silicon (requires consented reference audio)
+  endpoint:<id> — OpenAI-compatible /audio/speech via ModelEndpoint
+  browser       — client-side Web Speech API (no server synthesis)
+"""
 
 import io
+import time
 import wave
 import logging
 import hashlib
@@ -11,10 +22,12 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from src.constants import DATA_DIR, TTS_CACHE_DIR
+from src.constants import DATA_DIR, TTS_CACHE_DIR, TTS_VOICES_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +44,19 @@ PIPER_VOICE_CATALOG = [
     {"id": "pl_PL-darkman-medium", "language": "pl", "locale": "pl_PL", "name": "Darkman", "quality": "medium", "gender": "male", "sample": "Cześć, to jest polski głos.", "path": "pl/pl_PL/darkman/medium/pl_PL-darkman-medium"},
 ]
 
+# Curated Kokoro voice ids (subset of the 54 shipped voices; af/am = American
+# female/male, bf/bm = British female/male).
+KOKORO_VOICE_CATALOG = [
+    {"id": "af_heart", "name": "Heart", "gender": "female", "accent": "American"},
+    {"id": "af_bella", "name": "Bella", "gender": "female", "accent": "American"},
+    {"id": "af_nicole", "name": "Nicole", "gender": "female", "accent": "American"},
+    {"id": "af_sarah", "name": "Sarah", "gender": "female", "accent": "American"},
+    {"id": "am_adam", "name": "Adam", "gender": "male", "accent": "American"},
+    {"id": "am_michael", "name": "Michael", "gender": "male", "accent": "American"},
+    {"id": "bf_emma", "name": "Emma", "gender": "female", "accent": "British"},
+    {"id": "bm_george", "name": "George", "gender": "male", "accent": "British"},
+]
+
 
 def _safe_speed(value, default: float = 1.0) -> float:
     """Parse the stored tts_speed defensively. The settings layer tolerates
@@ -44,6 +70,37 @@ def _safe_speed(value, default: float = 1.0) -> float:
     return speed if speed > 0 else default
 
 
+def _wav_duration_seconds(data: bytes) -> float:
+    """Duration of a WAV payload, or 0.0 if unparseable (e.g. mp3)."""
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wf:
+            rate = wf.getframerate()
+            return wf.getnframes() / rate if rate else 0.0
+    except Exception:
+        return 0.0
+
+
+def _float_audio_to_wav(audio, sample_rate: int = 24000) -> Optional[bytes]:
+    """Convert a float32 mono waveform (numpy-convertible) to 16-bit WAV bytes."""
+    try:
+        import numpy as np
+
+        arr = np.asarray(audio, dtype="float32").reshape(-1)
+        if arr.size == 0:
+            return None
+        arr = np.clip(arr, -1.0, 1.0)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(int(sample_rate))
+            wf.writeframes((arr * 32767).astype(np.int16).tobytes())
+        return buf.getvalue()
+    except Exception as e:
+        logger.error("Failed to encode waveform to WAV: %s", e, exc_info=True)
+        return None
+
+
 class TTSService:
     """Multi-provider TTS service.
 
@@ -52,14 +109,30 @@ class TTSService:
       "disabled"        — no TTS
       "browser"         — client-side Web Speech API (no server synthesis)
       "piper"           — Piper CLI using a local .onnx voice model
-      "local"           — Kokoro-82M on GPU (legacy local provider)
+      "kokoro" / "local"— Kokoro-82M (MLX on Apple Silicon, else torch)
+      "dots_tts_mlx"    — experimental dots.tts custom-voice engine (MLX)
       "endpoint:<id>"   — OpenAI-compatible /audio/speech via ModelEndpoint
     """
 
-    def __init__(self, cache_dir: str = TTS_CACHE_DIR):
+    def __init__(self, cache_dir: str = TTS_CACHE_DIR, voices_file: str = TTS_VOICES_FILE):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.voices_file = Path(voices_file)
         self._kokoro = None  # lazy-init
+        self._dots = None    # lazy-init
+        self._voices_lock = threading.Lock()
+        # Rolling synthesis telemetry (updated from threadpool workers; simple
+        # dict mutation under the GIL is fine for these counters).
+        self.telemetry = {
+            "synth_count": 0,
+            "error_count": 0,
+            "fallback_count": 0,
+            "cache_hits": 0,
+            "last_provider": "",
+            "last_latency_ms": 0,
+            "last_audio_seconds": 0.0,
+            "last_rtf": 0.0,  # synthesis time / audio duration (lower is better)
+        }
 
     # ── Settings ──
 
@@ -75,26 +148,44 @@ class TTSService:
             "tts_piper_voice_by_language": saved.get("tts_piper_voice_by_language", {}),
             "tts_piper_default_language": saved.get("tts_piper_default_language", "en"),
             "tts_piper_voices_dir": saved.get("tts_piper_voices_dir", ""),
+            "tts_voice_profile": saved.get("tts_voice_profile", ""),
+            "tts_kokoro_model": saved.get("tts_kokoro_model", "prince-canuma/Kokoro-82M"),
+            "tts_dots_model": saved.get("tts_dots_model", ""),
         }
+
+    @staticmethod
+    def _normalize_provider(provider: str) -> str:
+        # "local" predates the provider tiers and always meant Kokoro.
+        return "kokoro" if provider == "local" else provider
 
     @property
     def available(self) -> bool:
         settings = self._load_settings()
         if settings.get("tts_enabled") is False:
             return False
-        provider = settings["tts_provider"]
+        provider = self._effective_provider(settings)
         if provider == "disabled":
             return False
         if provider == "browser":
             return True  # handled client-side
         if provider == "piper":
             return self._piper_available(settings)
-        if provider == "local":
-            kokoro = self._get_kokoro()
-            return kokoro is not None and kokoro.available
+        if provider == "kokoro":
+            # Kokoro loads lazily on first synthesis; report available when the
+            # runtime is importable so the UI doesn't block on a model download.
+            return self._get_kokoro().runtime_installed() or self._piper_available(settings)
+        if provider == "dots_tts_mlx":
+            return self._get_dots().configured(settings) or self._piper_available(settings)
         if provider.startswith("endpoint:"):
             return True  # assume reachable; errors surface at synthesis time
         return False
+
+    def _effective_provider(self, settings: dict) -> str:
+        """Provider after resolving the default voice profile, if any."""
+        profile = self.get_voice_profile(settings.get("tts_voice_profile") or "")
+        if profile:
+            return self._normalize_provider(profile.get("provider") or "")
+        return self._normalize_provider(settings["tts_provider"])
 
     # ── Cache ──
 
@@ -120,12 +211,174 @@ class TTSService:
             count += 1
         logger.info(f"Cleared {count} cached TTS files")
 
-    # ── Kokoro (local) ──
+    # ── Voice profiles ──
+    #
+    # A voice profile bundles everything needed to reproduce a voice: provider,
+    # voice id / model path, speed, a sample sentence for previews, and — for
+    # cloned/custom voices — consent and source notes. Stored in
+    # data/tts-voices.json; the default profile id lives in settings
+    # (tts_voice_profile) so it round-trips through the normal settings API.
+
+    def _load_voices_file(self) -> dict:
+        try:
+            if self.voices_file.exists():
+                data = json.loads(self.voices_file.read_text())
+                if isinstance(data, dict) and isinstance(data.get("profiles"), list):
+                    return data
+        except Exception as e:
+            logger.error("Failed to load %s: %s", self.voices_file, e)
+        return {"profiles": []}
+
+    def _save_voices_file(self, data: dict):
+        self.voices_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.voices_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        tmp.replace(self.voices_file)
+
+    def list_voice_profiles(self) -> list[dict]:
+        settings = self._load_settings()
+        default_id = settings.get("tts_voice_profile") or ""
+        profiles = self._load_voices_file()["profiles"]
+        for p in profiles:
+            p["is_default"] = p.get("id") == default_id
+        return profiles
+
+    def get_voice_profile(self, profile_id: str) -> Optional[dict]:
+        if not profile_id:
+            return None
+        for p in self._load_voices_file()["profiles"]:
+            if p.get("id") == profile_id:
+                return p
+        return None
+
+    def save_voice_profile(self, profile: dict) -> dict:
+        """Create or update a voice profile. Returns the stored profile."""
+        provider = self._normalize_provider((profile.get("provider") or "").strip())
+        if provider not in ("piper", "kokoro", "dots_tts_mlx") and not provider.startswith("endpoint:"):
+            raise ValueError(f"unknown provider: {provider or '(empty)'}")
+        name = (profile.get("name") or "").strip()
+        if not name:
+            raise ValueError("name is required")
+        stored = {
+            "id": (profile.get("id") or "").strip() or uuid.uuid4().hex[:12],
+            "name": name,
+            "provider": provider,
+            # voice id (kokoro/endpoint) or speaker id (piper)
+            "voice": (profile.get("voice") or "").strip(),
+            # .onnx path (piper) or HF repo / local model path (kokoro, dots)
+            "model_path": (profile.get("model_path") or "").strip(),
+            "speed": _safe_speed(profile.get("speed"), 1.0),
+            "sample_text": (profile.get("sample_text") or "").strip() or "Hello! This is a preview of my voice.",
+            # Custom-voice provenance — required for cloned voices.
+            "consent_note": (profile.get("consent_note") or "").strip(),
+            "source": (profile.get("source") or "").strip(),
+            # Reference audio for zero-shot cloning (dots.tts)
+            "ref_audio": (profile.get("ref_audio") or "").strip(),
+            "ref_text": (profile.get("ref_text") or "").strip(),
+            "created_at": profile.get("created_at") or time.time(),
+        }
+        if provider == "dots_tts_mlx" and stored["ref_audio"] and not stored["consent_note"]:
+            raise ValueError("custom/cloned voices require a consent note describing permission to use the reference audio")
+        with self._voices_lock:
+            data = self._load_voices_file()
+            existing = [p for p in data["profiles"] if p.get("id") != stored["id"]]
+            existing.append(stored)
+            data["profiles"] = existing
+            self._save_voices_file(data)
+        return stored
+
+    def delete_voice_profile(self, profile_id: str) -> bool:
+        with self._voices_lock:
+            data = self._load_voices_file()
+            before = len(data["profiles"])
+            data["profiles"] = [p for p in data["profiles"] if p.get("id") != profile_id]
+            if len(data["profiles"]) == before:
+                return False
+            self._save_voices_file(data)
+        # Unset as default if it was the default
+        from src.settings import load_settings, save_settings
+        settings = load_settings()
+        if settings.get("tts_voice_profile") == profile_id:
+            settings["tts_voice_profile"] = ""
+            save_settings(settings)
+        return True
+
+    def set_default_voice_profile(self, profile_id: str):
+        from src.settings import load_settings, save_settings
+        if profile_id and not self.get_voice_profile(profile_id):
+            raise ValueError(f"voice profile not found: {profile_id}")
+        settings = load_settings()
+        settings["tts_voice_profile"] = profile_id or ""
+        profile = self.get_voice_profile(profile_id) if profile_id else None
+        if profile:
+            # Keep the flat provider setting in sync so legacy consumers
+            # (availability checks, stats) agree with the profile.
+            settings["tts_provider"] = profile["provider"]
+        save_settings(settings)
+
+    # ── Providers overview ──
+
+    def list_providers(self) -> list[dict]:
+        settings = self._load_settings()
+        kokoro = self._get_kokoro()
+        dots = self._get_dots()
+        piper_ok = self._piper_available(settings)
+        active = self._effective_provider(settings)
+        rows = [
+            {
+                "id": "kokoro",
+                "label": "Kokoro-82M",
+                "tier": "Fast natural (recommended for live chat)",
+                "experimental": False,
+                "installed": kokoro.runtime_installed(),
+                "available": kokoro.runtime_installed(),
+                "backend": kokoro.backend_name(),
+                "model": settings.get("tts_kokoro_model"),
+                "voices": KOKORO_VOICE_CATALOG,
+                "hint": "" if kokoro.runtime_installed() else "Install with: pip install mlx-audio (Apple Silicon) or pip install kokoro soundfile",
+            },
+            {
+                "id": "piper",
+                "label": "Piper",
+                "tier": "Lightweight fallback (always works)",
+                "experimental": False,
+                "installed": bool(shutil.which(self._piper_bin())),
+                "available": piper_ok,
+                "backend": "cli",
+                "model": self._piper_model(settings),
+                "voices": [],
+                "hint": "" if piper_ok else "Install piper and download a voice from the Voice Library",
+            },
+            {
+                "id": "dots_tts_mlx",
+                "label": "dots.tts (MLX)",
+                "tier": "Experimental — custom voices / cloning (consented audio only)",
+                "experimental": True,
+                "installed": dots.runtime_installed(),
+                "available": dots.configured(settings),
+                "backend": "mlx",
+                "model": settings.get("tts_dots_model") or "(not configured)",
+                "voices": [],
+                "hint": dots.hint(settings),
+            },
+        ]
+        for row in rows:
+            row["active"] = row["id"] == active
+        return rows
+
+    # ── Kokoro ──
 
     def _get_kokoro(self):
         if self._kokoro is None:
-            self._kokoro = _KokoroPipeline()
+            self._kokoro = _KokoroEngine()
         return self._kokoro
+
+    # ── dots.tts (MLX) ──
+
+    def _get_dots(self):
+        if self._dots is None:
+            self._dots = _DotsTtsMlx()
+        return self._dots
 
     # ── Piper (local CPU TTS) ──
 
@@ -157,7 +410,7 @@ class TTSService:
         model = self._piper_model(settings)
         return bool(binary and model and Path(model).expanduser().exists())
 
-    def _synthesize_piper(self, text: str, settings: dict, speed: float = 1.0, language: str = "", model_override: str = "") -> Optional[bytes]:
+    def _synthesize_piper(self, text: str, settings: dict, speed: float = 1.0, language: str = "", model_override: str = "", voice_override: str = "") -> Optional[bytes]:
         binary = shutil.which(self._piper_bin())
         model = self._piper_model(settings, language=language, model_override=model_override)
         if not binary:
@@ -182,7 +435,7 @@ class TTSService:
             if config_path:
                 cmd.extend(["--config", str(Path(config_path).expanduser())])
 
-            voice = (settings.get("tts_voice") or "").strip()
+            voice = (voice_override or settings.get("tts_voice") or "").strip()
             if voice.isdigit():
                 cmd.extend(["--speaker", voice])
 
@@ -263,9 +516,9 @@ class TTSService:
 
     def _detect_language(self, text: str, settings: dict) -> str:
         lowered = f" {text.lower()} "
-        if any("\u0400" <= ch <= "\u04ff" for ch in text):
+        if any("Ѐ" <= ch <= "ӿ" for ch in text):
             return "ru"
-        if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+        if any("一" <= ch <= "鿿" for ch in text):
             return "zh"
 
         scores = {
@@ -346,13 +599,13 @@ class TTSService:
             logger.error("Failed to concatenate Piper WAV segments: %s", e, exc_info=True)
             return None
 
-    def _synthesize_piper_multilingual(self, text: str, settings: dict, speed: float = 1.0) -> Optional[bytes]:
+    def _synthesize_piper_multilingual(self, text: str, settings: dict, speed: float = 1.0, model_override: str = "", voice_override: str = "") -> Optional[bytes]:
         voice_map = settings.get("tts_piper_voice_by_language") or {}
-        if not isinstance(voice_map, dict) or not voice_map:
-            return self._synthesize_piper(text, settings, speed)
+        if model_override or not isinstance(voice_map, dict) or not voice_map:
+            return self._synthesize_piper(text, settings, speed, model_override=model_override, voice_override=voice_override)
         wavs = []
         for segment in self._split_language_segments(text, settings):
-            wav = self._synthesize_piper(segment["text"], settings, speed, language=segment["language"])
+            wav = self._synthesize_piper(segment["text"], settings, speed, language=segment["language"], voice_override=voice_override)
             if wav:
                 wavs.append(wav)
         return self._concat_wavs(wavs) if len(wavs) > 1 else (wavs[0] if wavs else None)
@@ -405,14 +658,58 @@ class TTSService:
 
     # ── Public interface ──
 
-    def synthesize(self, text: str, use_cache: bool = True) -> Optional[bytes]:
+    def _resolve_voice_config(self, settings: dict, profile_id: str = "") -> dict:
+        """Merge the active voice profile (explicit id, or the default from
+        settings) over the flat tts_* settings."""
+        profile = self.get_voice_profile(profile_id or settings.get("tts_voice_profile") or "")
+        provider = self._normalize_provider(settings["tts_provider"])
+        cfg = {
+            "provider": provider,
+            "model": settings["tts_model"],
+            "voice": settings["tts_voice"],
+            "speed": _safe_speed(settings.get("tts_speed", "1")),
+            "model_path": "",
+            "ref_audio": "",
+            "ref_text": "",
+            "profile_id": "",
+        }
+        if profile:
+            cfg["provider"] = self._normalize_provider(profile.get("provider") or provider)
+            cfg["voice"] = profile.get("voice") or cfg["voice"]
+            cfg["model_path"] = profile.get("model_path") or ""
+            cfg["speed"] = _safe_speed(profile.get("speed"), cfg["speed"])
+            cfg["ref_audio"] = profile.get("ref_audio") or ""
+            cfg["ref_text"] = profile.get("ref_text") or ""
+            cfg["profile_id"] = profile.get("id") or ""
+        return cfg
+
+    def _synthesize_with_provider(self, text: str, cfg: dict, settings: dict) -> Optional[bytes]:
+        provider = cfg["provider"]
+        if provider == "piper":
+            return self._synthesize_piper_multilingual(
+                text, settings, cfg["speed"],
+                model_override=cfg["model_path"], voice_override=cfg["voice"],
+            )
+        if provider == "kokoro":
+            kokoro = self._get_kokoro()
+            model = cfg["model_path"] or settings.get("tts_kokoro_model") or "prince-canuma/Kokoro-82M"
+            return kokoro.synthesize(text, voice=cfg["voice"] or "af_heart", speed=cfg["speed"], model=model)
+        if provider == "dots_tts_mlx":
+            dots = self._get_dots()
+            model = cfg["model_path"] or settings.get("tts_dots_model") or ""
+            return dots.synthesize(text, model=model, ref_audio=cfg["ref_audio"], ref_text=cfg["ref_text"], speed=cfg["speed"])
+        if provider.startswith("endpoint:"):
+            endpoint_id = provider.split(":", 1)[1]
+            return self._synthesize_api(text, endpoint_id, cfg["model"], cfg["voice"], cfg["speed"])
+        logger.error(f"Unknown TTS provider: {provider}")
+        return None
+
+    def synthesize(self, text: str, use_cache: bool = True, profile_id: str = "") -> Optional[bytes]:
         settings = self._load_settings()
         if settings.get("tts_enabled") is False:
             return None
-        provider = settings["tts_provider"]
-        model = settings["tts_model"]
-        voice = settings["tts_voice"]
-        speed = _safe_speed(settings.get("tts_speed", "1"))
+        cfg = self._resolve_voice_config(settings, profile_id)
+        provider = cfg["provider"]
 
         if provider in ("disabled", "browser"):
             return None
@@ -420,40 +717,53 @@ class TTSService:
         if len(text) > 5000:
             text = text[:5000]
 
-        cache_model = model
-        if provider == "piper":
-            cache_model = json.dumps(settings.get("tts_piper_voice_by_language") or model, sort_keys=True)
+        cache_model = cfg["model"]
+        if provider == "piper" and not cfg["model_path"]:
+            cache_model = json.dumps(settings.get("tts_piper_voice_by_language") or cfg["model"], sort_keys=True)
+        elif cfg["model_path"]:
+            cache_model = cfg["model_path"]
+        # Profile id in the key ensures switching profiles never replays stale audio.
+        cache_voice = f"{cfg['profile_id']}:{cfg['voice']}" if cfg["profile_id"] else cfg["voice"]
 
+        key = self._cache_key(text, provider, cache_model, cache_voice, cfg["speed"])
         if use_cache:
-            key = self._cache_key(text, provider, cache_model, voice, speed)
             cached = self._get_cached(key)
             if cached:
+                self.telemetry["cache_hits"] += 1
                 logger.info(f"TTS cache hit ({len(text)} chars)")
                 return cached
 
-        audio_data = None
+        started = time.monotonic()
+        audio_data = self._synthesize_with_provider(text, cfg, settings)
 
-        if provider == "piper":
-            audio_data = self._synthesize_piper_multilingual(text, settings, speed)
-        elif provider == "local":
-            kokoro = self._get_kokoro()
-            if kokoro and kokoro.available:
-                audio_data = kokoro.synthesize_raw(text, voice)
-            else:
-                logger.warning("Kokoro TTS not available")
-                return None
-        elif provider.startswith("endpoint:"):
-            endpoint_id = provider.split(":", 1)[1]
-            audio_data = self._synthesize_api(text, endpoint_id, model, voice, speed)
+        # Fallback tier: if the fancy provider fails mid-conversation, Piper
+        # keeps the voice loop talking instead of going silent.
+        if audio_data is None and provider not in ("piper",) and self._piper_available(settings):
+            logger.warning("TTS provider %s failed — falling back to Piper", provider)
+            self.telemetry["fallback_count"] += 1
+            audio_data = self._synthesize_piper_multilingual(text, settings, cfg["speed"])
+
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if audio_data:
+            duration = _wav_duration_seconds(audio_data)
+            self.telemetry["synth_count"] += 1
+            self.telemetry["last_provider"] = provider
+            self.telemetry["last_latency_ms"] = elapsed_ms
+            self.telemetry["last_audio_seconds"] = round(duration, 2)
+            self.telemetry["last_rtf"] = round((elapsed_ms / 1000.0) / duration, 3) if duration else 0.0
+            if use_cache:
+                self._put_cache(key, audio_data)
         else:
-            logger.error(f"Unknown TTS provider: {provider}")
-            return None
-
-        if audio_data and use_cache:
-            key = self._cache_key(text, provider, cache_model, voice, speed)
-            self._put_cache(key, audio_data)
+            self.telemetry["error_count"] += 1
 
         return audio_data
+
+    def preview_voice_profile(self, profile_id: str, text: str = "") -> Optional[bytes]:
+        profile = self.get_voice_profile(profile_id)
+        if not profile:
+            return None
+        sample = text or profile.get("sample_text") or "Hello! This is a preview of my voice."
+        return self.synthesize(sample, use_cache=True, profile_id=profile_id)
 
     def synthesize_to_base64(self, text: str) -> Optional[str]:
         import base64
@@ -467,13 +777,14 @@ class TTSService:
 
     def get_stats(self) -> Dict[str, Any]:
         settings = self._load_settings()
-        provider = settings["tts_provider"]
+        provider = self._effective_provider(settings)
         tts_enabled = settings.get("tts_enabled", True)
 
         cache_files = list(self.cache_dir.glob("*.wav")) + list(self.cache_dir.glob("*.mp3"))
         cache_size = sum(f.stat().st_size for f in cache_files)
 
         is_available = self.available and tts_enabled
+        profile = self.get_voice_profile(settings.get("tts_voice_profile") or "")
         stats = {
             "available": is_available,
             "ready": is_available,
@@ -481,18 +792,32 @@ class TTSService:
             "model": settings["tts_model"],
             "voice": settings["tts_voice"],
             "speed": _safe_speed(settings.get("tts_speed", "1")),
+            "voice_profile": profile["id"] if profile else "",
+            "voice_profile_name": profile["name"] if profile else "",
+            # Cache-busting key for client-side audio caches: changes whenever
+            # the effective voice changes.
+            "voice_key": f"{provider}|{profile['id'] if profile else settings['tts_voice']}",
             "cache_entries": len(cache_files),
             "cache_size_mb": round(cache_size / (1024 * 1024), 2),
+            "telemetry": dict(self.telemetry),
         }
+        if profile:
+            stats["voice"] = profile.get("voice") or stats["voice"]
+            stats["speed"] = _safe_speed(profile.get("speed"), stats["speed"])
 
-        if provider == "local":
+        if provider == "kokoro":
             kokoro = self._get_kokoro()
-            stats["model"] = "Kokoro-82M (GPU)" if (kokoro and kokoro.available) else "Kokoro (not loaded)"
+            backend = kokoro.backend_name()
+            stats["model"] = f"Kokoro-82M ({backend})" if backend else "Kokoro (runtime not installed)"
+            if not kokoro.runtime_installed() and self._piper_available(settings):
+                stats["model"] += " — using Piper fallback"
         elif provider == "piper":
             model = self._piper_model(settings)
             stats["model"] = model or "Piper model not configured"
             stats["ready"] = self._piper_available(settings)
             stats["available"] = stats["ready"] and tts_enabled
+        elif provider == "dots_tts_mlx":
+            stats["model"] = settings.get("tts_dots_model") or "dots.tts (not configured)"
         elif provider == "browser":
             stats["model"] = "Browser (Web Speech API)"
         elif provider.startswith("endpoint:"):
@@ -501,63 +826,204 @@ class TTSService:
         return stats
 
 
-class _KokoroPipeline:
-    """Encapsulates the Kokoro-82M local GPU pipeline."""
+class _KokoroEngine:
+    """Kokoro-82M with two interchangeable backends:
+
+    1. mlx-audio (preferred on Apple Silicon — Metal via MLX)
+    2. the `kokoro` torch package (CUDA → MPS → CPU)
+
+    The model loads lazily on first synthesis; loading can take tens of
+    seconds on a cold Hugging Face cache, so callers must run this in a
+    threadpool, never on the event loop.
+    """
 
     def __init__(self):
-        self.pipeline = None
-        self.available = False
-        self.device = None
-        self._init()
+        self._lock = threading.Lock()
+        self._mlx_model = None
+        self._mlx_model_id = None
+        self._torch_pipeline = None
+        self._torch_device = None
+        self._backend = None  # "mlx" | "torch" | None
 
-    def _init(self):
-        try:
-            import torch
-            from kokoro import KPipeline
+    def runtime_installed(self) -> bool:
+        import importlib.util
+        return bool(
+            importlib.util.find_spec("mlx_audio")
+            or importlib.util.find_spec("kokoro")
+        )
 
-            if not torch.cuda.is_available():
-                logger.warning("CUDA not available for Kokoro TTS")
-                return
+    def backend_name(self) -> str:
+        if self._backend == "mlx":
+            return "MLX / Apple Silicon"
+        if self._backend == "torch":
+            return f"torch / {self._torch_device}"
+        import importlib.util
+        if importlib.util.find_spec("mlx_audio"):
+            return "MLX / Apple Silicon (not loaded yet)"
+        if importlib.util.find_spec("kokoro"):
+            return "torch (not loaded yet)"
+        return ""
 
-            self.device = torch.device("cuda:0")
-            with torch.cuda.device(0):
-                self.pipeline = KPipeline(lang_code="a")
-                if hasattr(self.pipeline, "model"):
-                    self.pipeline.model = self.pipeline.model.to(self.device)
-            self.available = True
-            logger.info("Kokoro-82M TTS pipeline loaded")
-        except ImportError as e:
-            logger.warning(f"Kokoro TTS not available: {e}")
-            logger.warning("Install with: pip install kokoro soundfile")
-        except Exception as e:
-            logger.error(f"Kokoro init failed: {e}", exc_info=True)
+    # legacy attribute kept for anything poking at the old pipeline object
+    @property
+    def available(self) -> bool:
+        return self.runtime_installed()
 
+    def synthesize(self, text: str, voice: str = "af_heart", speed: float = 1.0, model: str = "prince-canuma/Kokoro-82M") -> Optional[bytes]:
+        with self._lock:
+            audio = self._synthesize_mlx(text, voice, speed, model)
+            if audio is not None:
+                return audio
+            return self._synthesize_torch(text, voice, speed)
+
+    # legacy signature used by old callers
     def synthesize_raw(self, text: str, voice: str = "af_heart") -> Optional[bytes]:
-        if not self.available:
-            return None
+        return self.synthesize(text, voice=voice)
+
+    def _synthesize_mlx(self, text: str, voice: str, speed: float, model: str) -> Optional[bytes]:
         try:
+            import importlib.util
+            if not importlib.util.find_spec("mlx_audio"):
+                return None
+            from mlx_audio.tts.utils import load_model
+
+            if self._mlx_model is None or self._mlx_model_id != model:
+                logger.info("Loading Kokoro MLX model: %s", model)
+                self._mlx_model = load_model(model)
+                self._mlx_model_id = model
+                self._backend = "mlx"
+
+            import numpy as np
+            segments = []
+            sample_rate = 24000
+            for result in self._mlx_model.generate(text=text, voice=voice, speed=speed):
+                seg = getattr(result, "audio", None)
+                if seg is None:
+                    continue
+                sample_rate = int(getattr(result, "sample_rate", sample_rate) or sample_rate)
+                segments.append(np.asarray(seg, dtype="float32").reshape(-1))
+            if not segments:
+                return None
+            return _float_audio_to_wav(np.concatenate(segments), sample_rate)
+        except Exception as e:
+            logger.error("Kokoro MLX synthesis failed: %s", e, exc_info=True)
+            # Drop the model so a corrupt load doesn't poison every later call
+            self._mlx_model = None
+            self._mlx_model_id = None
+            return None
+
+    def _synthesize_torch(self, text: str, voice: str, speed: float) -> Optional[bytes]:
+        try:
+            import importlib.util
+            if not importlib.util.find_spec("kokoro"):
+                return None
             import torch
             import numpy as np
+            from kokoro import KPipeline
 
-            with torch.cuda.device(self.device):
-                chunks = []
-                for _, _, audio in self.pipeline(text, voice=voice):
-                    chunks.append(audio)
+            if self._torch_pipeline is None:
+                if torch.cuda.is_available():
+                    device = "cuda:0"
+                elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                    device = "mps"
+                else:
+                    device = "cpu"
+                logger.info("Loading Kokoro torch pipeline on %s", device)
+                self._torch_pipeline = KPipeline(lang_code="a")
+                if hasattr(self._torch_pipeline, "model") and self._torch_pipeline.model is not None:
+                    self._torch_pipeline.model = self._torch_pipeline.model.to(device)
+                self._torch_device = device
+                self._backend = "torch"
 
+            chunks = []
+            for _, _, audio in self._torch_pipeline(text, voice=voice, speed=speed):
+                if hasattr(audio, "detach"):
+                    audio = audio.detach().cpu().numpy()
+                chunks.append(np.asarray(audio, dtype="float32").reshape(-1))
             if not chunks:
                 return None
-
-            full = np.concatenate(chunks)
-            buf = io.BytesIO()
-            with wave.open(buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(24000)
-                wf.writeframes((full * 32767).astype(np.int16).tobytes())
-            return buf.getvalue()
+            return _float_audio_to_wav(np.concatenate(chunks), 24000)
         except Exception as e:
-            logger.error(f"Kokoro synthesis failed: {e}", exc_info=True)
+            logger.error("Kokoro torch synthesis failed: %s", e, exc_info=True)
+            self._torch_pipeline = None
             return None
+
+
+class _DotsTtsMlx:
+    """Experimental dots.tts provider on Apple Silicon via mlx-audio.
+
+    dots.tts is a 2B-parameter Apache-2.0 TTS model with high-quality
+    zero-shot voice cloning. This provider loads a quantized MLX variant
+    (settings key tts_dots_model, e.g. an mf-int4 repo from dots-tts-mlx)
+    and passes optional consented reference audio for cloning. Everything is
+    defensive: if the runtime or model is missing, we report a hint instead
+    of erroring, and synthesis failures fall back to Piper upstream.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._model = None
+        self._model_id = None
+
+    def runtime_installed(self) -> bool:
+        import importlib.util
+        return bool(importlib.util.find_spec("mlx_audio"))
+
+    def configured(self, settings: dict) -> bool:
+        return self.runtime_installed() and bool(settings.get("tts_dots_model"))
+
+    def hint(self, settings: dict) -> str:
+        if not self.runtime_installed():
+            return "Install with: pip install mlx-audio, then set a dots.tts MLX model repo in settings (tts_dots_model)"
+        if not settings.get("tts_dots_model"):
+            return "Set tts_dots_model to a dots-tts-mlx repo (e.g. an mf-int4 quant) or local path"
+        return ""
+
+    def synthesize(self, text: str, model: str, ref_audio: str = "", ref_text: str = "", speed: float = 1.0) -> Optional[bytes]:
+        if not model:
+            logger.warning("dots.tts model not configured (settings key tts_dots_model)")
+            return None
+        with self._lock:
+            try:
+                from mlx_audio.tts.utils import load_model
+
+                if self._model is None or self._model_id != model:
+                    logger.info("Loading dots.tts MLX model: %s", model)
+                    self._model = load_model(model)
+                    self._model_id = model
+
+                kwargs = {"text": text}
+                if ref_audio and Path(ref_audio).expanduser().exists():
+                    kwargs["ref_audio"] = str(Path(ref_audio).expanduser())
+                    if ref_text:
+                        kwargs["ref_text"] = ref_text
+                if speed and speed != 1.0:
+                    kwargs["speed"] = speed
+
+                import numpy as np
+                segments = []
+                sample_rate = 24000
+                try:
+                    results = self._model.generate(**kwargs)
+                except TypeError:
+                    # Older/newer mlx-audio versions vary in accepted kwargs —
+                    # retry with the minimal call before giving up.
+                    kwargs.pop("speed", None)
+                    results = self._model.generate(**kwargs)
+                for result in results:
+                    seg = getattr(result, "audio", None)
+                    if seg is None:
+                        continue
+                    sample_rate = int(getattr(result, "sample_rate", sample_rate) or sample_rate)
+                    segments.append(np.asarray(seg, dtype="float32").reshape(-1))
+                if not segments:
+                    return None
+                return _float_audio_to_wav(np.concatenate(segments), sample_rate)
+            except Exception as e:
+                logger.error("dots.tts synthesis failed: %s", e, exc_info=True)
+                self._model = None
+                self._model_id = None
+                return None
 
 
 # Module-level singleton

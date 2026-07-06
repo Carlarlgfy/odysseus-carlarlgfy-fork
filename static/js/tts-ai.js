@@ -12,10 +12,24 @@ class AITTSManager {
         this._provider = 'disabled';
         this.autoPlay = false;
         this.cache = new Map(); // Client-side audio cache
+        this._voiceKey = '';    // Server voice identity — cache is invalid across voice switches
 
         // Queue for sequential auto-play
-        this._queue = [];       // Array of { text, button, resetFn }
+        this._queue = [];       // Array of { text, button, resetFn, enqueuedAt }
         this._processing = false;
+        // Cancellation generation — bumped by stop(); anything awaited under an
+        // older generation must abandon its result instead of playing stale audio.
+        this._generation = 0;
+        this._abortController = null;
+
+        // Playback telemetry for the voice loop (inspect via window.aiTTSManager.telemetry)
+        this.telemetry = {
+            spokenItems: 0,
+            errors: 0,
+            interruptions: 0,       // stop() while something was playing/queued
+            lastFirstAudioMs: 0,    // enqueue → playback start for the last item
+            maxQueueDepth: 0,
+        };
 
         // Streaming sentence-by-sentence TTS state
         this._streamSentencesSent = 0;  // chars of plain text already queued
@@ -50,6 +64,14 @@ class AITTSManager {
             this.available = stats.available && stats.ready;
             this.playbackSpeed = stats.speed || 1;
             this._provider = stats.provider || 'disabled';
+
+            // Voice switch invalidates the client audio cache — otherwise a new
+            // voice replays audio synthesized with the old one.
+            const voiceKey = stats.voice_key || (stats.provider + '|' + (stats.voice || ''));
+            if (this._voiceKey && voiceKey !== this._voiceKey) {
+                this.clearCache();
+            }
+            this._voiceKey = voiceKey;
 
             if (stats.provider === 'browser') {
                 this.useBrowserTTS = true;
@@ -90,6 +112,11 @@ class AITTSManager {
             .replace(/\*(.+?)\*/g, '$1') // Remove italic
             .replace(/\[(.+?)\]\(.+?\)/g, '$1') // Remove links
             .replace(/`(.+?)`/g, '$1') // Remove inline code
+            .replace(/^\s*[-*+]\s+/gm, '') // Remove bullet markers
+            .replace(/^\s*>\s?/gm, '') // Remove blockquote markers
+            .replace(/^[\s]*[-=_*]{3,}[\s]*$/gm, '') // Remove horizontal rules
+            .replace(/\|/g, ', ') // Table pipes read as pauses, not "pipe"
+            .replace(/https?:\/\/\S+/g, 'a link') // URLs are unreadable aloud
             .replace(/\n{3,}/g, '\n\n') // Normalize line breaks
             .trim();
 
@@ -104,7 +131,8 @@ class AITTSManager {
             hash = ((hash << 5) - hash) + char;
             hash = hash & hash;
         }
-        return hash.toString(36);
+        // Scope to the active voice so switching voices never replays stale audio
+        return this._voiceKey + '#' + hash.toString(36);
     }
 
     async synthesize(text, onProgress = null) {
@@ -133,6 +161,7 @@ class AITTSManager {
         try {
             if (onProgress) onProgress('synthesizing');
 
+            if (!this._abortController) this._abortController = new AbortController();
             const response = await fetch('/api/tts/synthesize', {
                 method: 'POST',
                 headers: {
@@ -141,7 +170,8 @@ class AITTSManager {
                 body: JSON.stringify({
                     text: plainText,
                     format: 'audio'
-                })
+                }),
+                signal: this._abortController.signal
             });
 
             if (!response.ok) {
@@ -224,6 +254,17 @@ class AITTSManager {
     }
 
     stop() {
+        // Invalidate anything in flight: bump the generation so awaited
+        // synthesize/play results are abandoned, and abort the network request.
+        this._generation += 1;
+        if (this._abortController) {
+            try { this._abortController.abort(); } catch (_) {}
+            this._abortController = null;
+        }
+        if (this.isPlaying || this._processing || this._queue.length > 0) {
+            this.telemetry.interruptions += 1;
+        }
+
         // Cancel streaming TTS
         this._streamActive = false;
         if (this._streamDebounceTimer) {
@@ -257,7 +298,10 @@ class AITTSManager {
      * finishes before the next starts. Stopping any message clears the queue.
      */
     enqueue(text, button, resetFn) {
-        this._queue.push({ text, button, resetFn });
+        this._queue.push({ text, button, resetFn, enqueuedAt: Date.now() });
+        if (this._queue.length > this.telemetry.maxQueueDepth) {
+            this.telemetry.maxQueueDepth = this._queue.length;
+        }
         if (!this._processing) {
             this._processQueue();
         }
@@ -266,15 +310,20 @@ class AITTSManager {
     async _processQueue() {
         if (this._processing) return;
         this._processing = true;
+        const generation = this._generation;
         window.dispatchEvent(new CustomEvent('odysseus:tts-start'));
 
         while (this._queue.length > 0) {
             const item = this._queue[0];
             try {
-                await this._playQueueItem(item);
+                await this._playQueueItem(item, generation);
             } catch (err) {
-                console.error('TTS queue item error:', err);
+                if (err && err.name !== 'AbortError') {
+                    this.telemetry.errors += 1;
+                    console.error('TTS queue item error:', err);
+                }
             }
+            if (this._generation !== generation) return; // stopped mid-item
             if (this._queue.length > 0 && this._queue[0] === item) {
                 this._queue.shift();
             }
@@ -285,7 +334,7 @@ class AITTSManager {
         window.dispatchEvent(new CustomEvent('odysseus:tts-idle'));
     }
 
-    async _playQueueItem(item) {
+    async _playQueueItem(item, generation) {
         const { text, button, resetFn } = item;
         const ICON_LOADING = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="9" stroke-dasharray="42" stroke-dashoffset="12" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle></svg>';
         var ICON_STOP = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
@@ -296,11 +345,16 @@ class AITTSManager {
         button.title = 'Loading...';
 
         try {
-            if (!this._processing) return;
+            if (!this._processing || this._generation !== generation) return;
 
             const audioUrl = await this.synthesize(text);
 
-            if (!this._processing) return;
+            if (!this._processing || this._generation !== generation) return;
+
+            if (item.enqueuedAt) {
+                this.telemetry.lastFirstAudioMs = Date.now() - item.enqueuedAt;
+            }
+            this.telemetry.spokenItems += 1;
 
             button.innerHTML = ICON_STOP;
             button.classList.remove('loading');
@@ -408,10 +462,20 @@ class AITTSManager {
             current += newRegion[i];
             var ch = newRegion[i];
             var next = newRegion[i + 1];
-            if ((ch === '.' || ch === '!' || ch === '?') && next && /\s/.test(next)) {
+            var isSentenceEnd = (ch === '.' || ch === '!' || ch === '?') && next && /\s/.test(next);
+            // Newlines are hard boundaries (list items, paragraph breaks), and
+            // long clauses get spoken at phrase punctuation instead of waiting
+            // for a distant period — keeps first-audio latency low on rambly
+            // sentences without chopping short ones into fragments.
+            var isNewlineEnd = ch === '\n' && current.trim().length >= 15;
+            var isPhraseEnd = (ch === ':' || ch === ';' || ch === ',') && next && /\s/.test(next)
+                && current.trim().length >= (ch === ',' ? 160 : 80);
+            if (isSentenceEnd) {
                 var lastWord = current.trim().split(/\s/).pop() || '';
                 if (/^\d+\.$/.test(lastWord)) continue;
                 if (/^[A-Z][a-z]?\.$/.test(lastWord)) continue;
+            }
+            if (isSentenceEnd || isNewlineEnd || isPhraseEnd) {
                 sentences.push(current.trim());
                 current = '';
             }

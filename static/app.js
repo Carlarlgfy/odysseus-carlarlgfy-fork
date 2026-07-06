@@ -3777,6 +3777,7 @@ function startOdysseusApp() {
     let ttsWatchdog = null;
     let queueDrainTimer = null;
     let pendingTranscriptions = 0;
+    let lastBargeInAt = 0;
     const transcriptQueue = [];
     const TTS_SUPPRESS_WATCHDOG_MS = 30000;
     const CHAT_BUSY_TIMEOUT_MS = 60000;
@@ -3944,6 +3945,15 @@ function startOdysseusApp() {
               pendingTranscriptions = Math.max(0, pendingTranscriptions - 1);
               setTranscribing(pendingTranscriptions > 0);
             },
+            // Opt-in barge-in: interrupt TTS by talking over it. Off by default
+            // so the proven half-duplex flow is unchanged; toggle lives in the
+            // Voice Library ("Interrupt by speaking").
+            bargeIn: localStorage.getItem('odysseus_voice_barge_in') === '1',
+            onBargeIn: () => {
+              lastBargeInAt = Date.now();
+              uiModule.showToast('Interrupted');
+              if (window.aiTTSManager) window.aiTTSManager.stop();
+            },
             onVadLevel: localStorage.getItem('odysseus_voice_debug') === '1'
               ? ({ rms, threshold, loud, speaking }) => {
                   const now = Date.now();
@@ -3995,8 +4005,11 @@ function startOdysseusApp() {
       if (!active) return;
       clearTtsWatchdog();
       ttsBusy = false;
-      // 600ms cooldown after TTS ends to let room echo settle before re-enabling VAD
-      if (voiceRecorderModule.suppressVad) voiceRecorderModule.suppressVad(600);
+      // 600ms cooldown after TTS ends to let room echo settle before re-enabling
+      // VAD — except right after a barge-in, where the user is already mid-
+      // sentence and every suppressed ms loses their speech.
+      const justBargedIn = lastBargeInAt && Date.now() - lastBargeInAt < 1000;
+      if (voiceRecorderModule.suppressVad) voiceRecorderModule.suppressVad(justBargedIn ? 0 : 600);
       clearChatBusy();
       setTimeout(processTranscriptQueue, 700);
     });
